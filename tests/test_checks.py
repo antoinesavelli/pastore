@@ -4,6 +4,7 @@ Depends on: fucone.checks, tests.fakes (RecordingRunner).
 """
 
 import subprocess
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,7 @@ from fucone.checks import (
     host_idle_reason,
     mem_available_bytes,
     ollama_ok,
+    run_argv,
     stopped,
 )
 from tests.fakes import RecordingRunner
@@ -139,3 +141,27 @@ def test_stopped_is_file_existence(tmp_path: Path) -> None:
     assert not stopped(stop_file)
     stop_file.touch()
     assert stopped(stop_file)
+
+
+def test_multiarch_package_lines_must_all_match_the_module() -> None:
+    both = f"{PKG_VERSION}\n{PKG_VERSION}\n"
+    assert host_idle_reason(Env(package=both).host) is None
+    split = f"{PKG_VERSION}\n580.159.03-0ubuntu0.24.04.1\n"
+    assert host_idle_reason(Env(package=split).host) == "driver-mismatch"
+
+
+def test_unexpected_host_output_fails_closed_instead_of_raising() -> None:
+    env = Env()
+
+    def run(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if any(arg.startswith("--query-compute-apps") for arg in argv):
+            return subprocess.CompletedProcess([], 9, "", "")
+        return env.runner(argv)
+
+    broken_smi = Host(run=run, read_text=env.host.read_text, http_status=env.host.http_status)
+    assert host_idle_reason(broken_smi) == "driver-mismatch"
+    assert host_idle_reason(Env(meminfo="garbage\n").host) == "low-memory"
+
+
+def test_run_argv_turns_a_missing_binary_into_exit_127(tmp_path: Path) -> None:
+    assert run_argv([str(tmp_path / "missing")]).returncode == 127

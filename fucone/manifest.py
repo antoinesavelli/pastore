@@ -139,9 +139,13 @@ def _ready(value: object, cwd: Path, root: Path, which: Which) -> Ready | None:
     return Ready(parse_duration(raw["every"]), check)
 
 
-def _fingerprint(raw: dict[str, object]) -> str:
+def _fingerprint(raw: dict[str, object], consumer: str, root: Path) -> str:
     try:
-        text = json.dumps(raw, sort_keys=True, separators=(",", ":"))
+        text = json.dumps(
+            {"consumer": consumer, "root": str(root), "entry": raw},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
     except TypeError as exc:
         raise ManifestError(f"entry is not plain JSON-able data: {exc}") from exc
     return hashlib.sha256(text.encode()).hexdigest()
@@ -191,7 +195,7 @@ def _parse_task(
         reader=guard(lambda: _reader(raw.get("reader"), cwd, root, which), _NO_READER),
         ready=guard(lambda: _ready(raw.get("ready"), cwd, root, which), None),
         root=root,
-        fingerprint=guard(lambda: _fingerprint(raw), ""),
+        fingerprint=guard(lambda: _fingerprint(raw, consumer, root), ""),
     )
 
 

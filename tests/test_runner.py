@@ -85,7 +85,7 @@ def test_new_run_id_is_utc() -> None:
 
 
 def test_scope_argv_is_user_scope_in_heavy_jobs_slice() -> None:
-    argv = scope_argv("r1", ["python3", "x.py"])
+    argv = scope_argv("r1", ["python3", "x.py"], 7200)
     assert argv == [
         "systemd-run",
         "--user",
@@ -95,6 +95,8 @@ def test_scope_argv_is_user_scope_in_heavy_jobs_slice() -> None:
         "--unit=fucone-r1",
         "-p",
         "CPUWeight=20",
+        "-p",
+        "RuntimeMaxSec=7200",
         "--",
         "python3",
         "x.py",
@@ -143,7 +145,7 @@ def test_start_run_passes_wrapped_argv_explicit_env_and_new_session(tmp_path: Pa
         spec, run_dir, "r1", "http://u", {"PATH": "/bin", "SECRET": "s"}, popen=popen
     )
     assert handle.run_id == "r1"
-    assert seen["argv"] == scope_argv("r1", spec.argv)
+    assert seen["argv"] == scope_argv("r1", spec.argv, spec.timeout_s)
     assert seen["cwd"] == tmp_path and seen["start_new_session"] is True
     assert seen["stdin"] == subprocess.DEVNULL
     assert "SECRET" not in seen["env"] and seen["env"]["OLLAMA_HOST"] == "http://u"

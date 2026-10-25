@@ -5,6 +5,8 @@ Depends on: policy, manifest, state, dispatcher (serve), contract, checks/runner
 
 import argparse
 import os
+import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -32,6 +34,7 @@ from fucone.policy import (
 from fucone.runner import start_run
 from fucone.spec import TaskSpec
 from fucone.state import (
+    DispatcherLock,
     LockHeld,
     StateError,
     StatePaths,
@@ -40,9 +43,10 @@ from fucone.state import (
     open_state,
     reset,
 )
+from fucone.window import next_window_start
 
 HEARTBEAT_STALE = timedelta(seconds=60)
-SUBPROCESS_TIMEOUT_S = 600
+SUBPROCESS_TIMEOUT_S = 45
 DEFAULT_POLICY = Path(__file__).resolve().parent.parent / "policy.yaml"
 
 
@@ -102,6 +106,15 @@ def _status(ctx: Ctx, _args: argparse.Namespace) -> int:
     with closing(open_state(ctx.paths, readonly=True)) as state:
         _say(ctx, f"dispatcher: {'up' if up else 'dispatcher-down'}")
         _say(ctx, f"idle: {state.idle_reason() or 'none'}")
+        if state.idle_reason() == "outside-window":
+            policy = load_policy(ctx.policy_path)
+            opens = next_window_start(
+                ctx.clock().astimezone(), policy.window_start, policy.window_end
+            )
+            _say(ctx, f"next window opens: {opens.isoformat(timespec='minutes')}")
+        errors = [e for e in state.recent_events(200) if e.kind == "tick-error"]
+        if errors:
+            _say(ctx, f"last tick-error: {errors[0].at} {errors[0].detail}")
         try:
             jobs = load_policy(ctx.policy_path).jobs
         except PolicyError as exc:
@@ -126,9 +139,11 @@ def _stop(ctx: Ctx, args: argparse.Namespace) -> int:
 
 
 def _write_atomic(path: Path, text: str) -> None:
+    mode = stat.S_IMODE(path.stat().st_mode)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".policy-")
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         handle.write(text)
+    os.chmod(tmp, mode)
     os.replace(tmp, path)
 
 
@@ -216,12 +231,20 @@ def _reset(ctx: Ctx, _args: argparse.Namespace) -> int:
 
 def _contract(ctx: Ctx, ref: str) -> int:
     spec = _spec_for(load_policy(ctx.policy_path), ref)
-    result = run_contract(spec, ctx.paths.runs_dir, os.environ, clock=ctx.clock, sleep=time.sleep)
+    ctx.paths.state_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        with DispatcherLock(ctx.paths.lock):
+            result = run_contract(
+                spec, ctx.paths.runs_dir, os.environ, clock=ctx.clock, sleep=time.sleep
+            )
+    except LockHeld:
+        return _refuse("the dispatcher is running; stop it first (one job at a time)")
     for s in result.scenarios:
         verdict = "pass" if s.passed else "FAIL"
         _say(
             ctx,
-            f"{verdict} {s.name}: exit={s.exit_code} timed_out={s.timed_out} result_left={s.result_left} run={s.run_id}",
+            f"{verdict} {s.name}: exit={s.exit_code} timed_out={s.timed_out} "
+            f"result_left={s.result_left} contacted={s.contacted} run={s.run_id}",
         )
     if not result.passed:
         return _refuse(f"{ref}: contract test failed; it cannot be listed")
@@ -246,6 +269,8 @@ def _run_in(
         )
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(list(argv), 124, "", "timeout")
+    except OSError as exc:
+        return subprocess.CompletedProcess(list(argv), 127, "", str(exc))
 
 
 def _start(ctx: Ctx, _args: argparse.Namespace) -> int:
@@ -273,9 +298,14 @@ def _run_now(ctx: Ctx, args: argparse.Namespace) -> int:
     policy = load_policy(ctx.policy_path)
     if args.ref not in policy.jobs:
         return _refuse(f"{args.ref}: not listed in policy.yaml; only listed jobs run")
+    if not _has_contract_pass(ctx, args.ref, _spec_for(policy, args.ref).fingerprint):
+        return _refuse(f"{args.ref}: no contract pass for its current manifest entry")
     if not _dispatcher_up(ctx):
         return _refuse("dispatcher-down: start it first (fucone start)")
     with closing(open_state(ctx.paths)) as state:
+        job = state.get_job(args.ref)
+        if job is not None and job.status != "pending":
+            return _refuse(f"{args.ref}: is {job.status}; run `fucone rerun {args.ref}` first")
         state.request_run_now(args.ref)
     _say(ctx, f"run-now queued for {args.ref}; the dispatcher picks it up within one tick")
     return 0
@@ -318,5 +348,5 @@ def main(
     )
     try:
         return HANDLERS[args.cmd](ctx, args)
-    except (PolicyError, ManifestError, StateError) as exc:
-        return _refuse(str(exc))
+    except (PolicyError, ManifestError, StateError, sqlite3.Error, OSError) as exc:
+        return _refuse(f"{type(exc).__name__}: {exc}")

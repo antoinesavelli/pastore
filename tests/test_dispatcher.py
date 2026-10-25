@@ -6,6 +6,7 @@ Depends on: fucone.dispatcher with a fake Host, fake handles and a FakeClock; on
 import sys
 import time
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from subprocess import CompletedProcess
@@ -13,11 +14,19 @@ from subprocess import CompletedProcess
 import pytest
 
 from fucone.checks import MODULE_VERSION_FILE, Host
-from fucone.dispatcher import Deps, Dispatcher
-from fucone.policy import PolicyCache
+from fucone.dispatcher import Deps, Dispatcher, _guarded_tick, serve
+from fucone.policy import PolicyCache, PolicyError
 from fucone.runner import RunDir, start_run
 from fucone.spec import IDLE_REASONS, Ready, RunReader, TaskSpec, ValidateReader
-from fucone.state import EventRow, JobRow, State, default_paths, open_state
+from fucone.state import (
+    DispatcherLock,
+    EventRow,
+    JobRow,
+    LockHeld,
+    State,
+    default_paths,
+    open_state,
+)
 from tests.fakes import FakeClock, RecordingRunner
 
 INSIDE = datetime(2026, 10, 24, 2, 0, tzinfo=UTC)
@@ -95,6 +104,7 @@ class Rig:
         self.next_codes: list[int | None] = [0]
         self.reader_rc: dict[str, int] = {}
         self.run_in_calls: list[list[str]] = []
+        self.run_in_envs: list[dict[str, str]] = []
         self.clock = FakeClock(INSIDE)
         base: dict[str, object] = {
             "paths": self.paths,
@@ -116,6 +126,7 @@ class Rig:
         self, argv: Sequence[str], cwd: Path, env: Mapping[str, str]
     ) -> CompletedProcess[str]:
         self.run_in_calls.append(list(argv))
+        self.run_in_envs.append(dict(env))
         return CompletedProcess(list(argv), self.reader_rc.get(argv[0], 0), "", "")
 
     def start(
@@ -242,7 +253,9 @@ def test_crash_streak_resets_when_another_job_was_running(tmp_path: Path) -> Non
     rig.next_codes = [None]
     rig.tick()
     rig.d.recover(rig.clock())
-    rig.state.upsert_job(JobRow("c/a", "fp-a", "blocked"))
+    a = rig.state.get_job("c/a")
+    assert a is not None and a.crash_streak == 1
+    rig.state.upsert_job(replace(a, status="blocked"))
     rig.d = Dispatcher(rig.deps, rig.state, PolicyCache(rig.policy, lambda _m: None))
     rig.tick()
     assert rig.events("run-start")[0].ref == "c/b"
@@ -296,7 +309,10 @@ def test_ready_job_waiting_over_24h_is_flagged_starved_once(tmp_path: Path) -> N
     rig = Rig(tmp_path, [task(tmp_path, "a")], ["c/a"])
     rig.clock.now_value = OUTSIDE
     rig.tick()
-    rig.clock.advance(25 * 3600)
+    rig.clock.advance(23 * 3600)
+    rig.tick()
+    assert rig.events("starved") == []
+    rig.clock.advance(2 * 3600)
     rig.tick()
     rig.tick()
     assert len(rig.events("starved")) == 1
@@ -332,7 +348,7 @@ def test_invariant_job_never_writes_into_a_repo(tmp_path: Path) -> None:
     def real_start(
         spec: TaskSpec, run_dir: RunDir, run_id: str, url: str, env: Mapping[str, str]
     ) -> object:
-        return start_run(spec, run_dir, run_id, url, env, wrap=lambda _r, argv: list(argv))
+        return start_run(spec, run_dir, run_id, url, env, wrap=lambda _r, argv, _t: list(argv))
 
     rig = Rig(tmp_path, [], [], start=real_start)
     spec = task(rig.root, "a", argv=(sys.executable, str(script)))
@@ -372,3 +388,106 @@ def test_event_kinds_used_by_the_dispatcher_are_accepted_by_state(
     state = open_state(default_paths(tmp_path))
     state.record_event(INSIDE + timedelta(seconds=1), kind, "c/a", "x")
     assert state.recent_events(1)[0].kind == kind
+
+
+def test_recover_stops_leftover_scopes_and_unsticks_job_rows(tmp_path: Path) -> None:
+    rig = Rig(tmp_path, [task(tmp_path, "a")], ["c/a"])
+    rig.state.upsert_job(JobRow("c/a", "fp-a", "running"))
+    rig.d.recover(rig.clock())
+    runner = rig.deps.host.run
+    assert isinstance(runner, RecordingRunner)
+    assert any(c[:3] == ["systemctl", "--user", "list-units"] for c in runner.calls)
+    assert rig.job_status("a") == "pending"
+
+
+def test_readers_and_checks_get_no_dispatcher_secrets(tmp_path: Path) -> None:
+    spec = task(tmp_path, "a", ready=Ready(3600, ("./ready",)), env={"MODEL": "m"})
+    rig = Rig(tmp_path, [spec], ["c/a"])
+    rig.tick()
+    rig.tick()
+    check_env, reader_env = rig.run_in_envs[0], rig.run_in_envs[-1]
+    assert check_env == {"PATH": "/usr/bin", "MODEL": "m"}
+    assert "SECRET_TOKEN" not in reader_env and reader_env["FUCONE_RUN_DIR"].endswith("/out")
+
+
+def test_a_manifest_edit_reruns_a_done_one_shot(tmp_path: Path) -> None:
+    rig = Rig(tmp_path, [task(tmp_path, "a")], ["c/a"])
+    rig.tick()
+    rig.tick()
+    assert rig.job_status("a") == "done"
+    rig.tick()
+    assert len(rig.handles) == 1
+    edited = task(tmp_path, "a", fingerprint="fp-a2")
+    rig.specs["a"] = edited
+    rig.state.record_contract_pass(edited.ref, edited.fingerprint, INSIDE)
+    rig.tick()
+    assert len(rig.handles) == 2
+
+
+def test_run_now_never_restarts_a_done_job_and_a_blocked_one_is_recorded(tmp_path: Path) -> None:
+    rig = Rig(tmp_path, [task(tmp_path, "a")], ["c/a"])
+    rig.tick()
+    rig.tick()
+    rig.clock.now_value = OUTSIDE
+    rig.state.request_run_now("c/a")
+    rig.tick()
+    assert len(rig.handles) == 1 and "not pending" in rig.events("refused")[0].detail
+    rig.state.rerun("c/a")
+    rig.paths.stop_file.write_text("")
+    rig.state.request_run_now("c/a")
+    rig.tick()
+    assert rig.events("refused")[0].detail == "run-now: stopped"
+    rig.paths.stop_file.unlink()
+    rig.state.request_run_now("c/a")
+    rig.tick()
+    assert len(rig.handles) == 2
+
+
+def test_a_job_that_cannot_start_is_a_counted_failure(tmp_path: Path) -> None:
+    def broken_start(*_args: object) -> FakeHandle:
+        raise FileNotFoundError("./job")
+
+    rig = Rig(tmp_path, [task(tmp_path, "a")], ["c/a"], start=broken_start)
+    rig.tick()
+    job = rig.state.get_job("c/a")
+    assert job is not None and job.status == "pending" and job.attempts == 1
+    assert rig.d.active is None and "could not start" in rig.events("refused")[0].detail
+
+
+def test_guarded_tick_records_an_error_and_keeps_the_loop_alive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig = Rig(tmp_path, [task(tmp_path, "a")], ["c/a"])
+
+    def explode(_now: datetime) -> bool:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(rig.d, "tick", explode)
+    assert _guarded_tick(rig.d, rig.state, rig.clock) is True
+    assert rig.events("tick-error")[0].detail == "RuntimeError: boom"
+
+
+def test_serve_recovers_drops_stale_requests_and_stops_on_request(tmp_path: Path) -> None:
+    rig = Rig(tmp_path, [task(tmp_path, "a")], ["c/a"])
+    rig.state.request_stop("now")
+    rig.state.request_run_now("c/a")
+    sleeps: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        rig.clock.advance(seconds)
+        if len(sleeps) == 3:
+            rig.state.request_stop("graceful")
+
+    assert serve(rig.deps, rig.policy, clock=rig.clock, sleep=sleep) == 0
+    assert len(sleeps) == 3
+    assert rig.events("recover") and "dropped stale" in rig.events("dispatcher-start")[0].detail
+
+
+def test_serve_refuses_a_bad_policy_and_a_held_lock(tmp_path: Path) -> None:
+    rig = Rig(tmp_path, [task(tmp_path, "a")], ["c/a"])
+    with DispatcherLock(rig.paths.lock), pytest.raises(LockHeld):
+        serve(rig.deps, rig.policy, clock=rig.clock, sleep=lambda _s: None)
+    rig.policy.write_text("version: 2\n")
+    with pytest.raises(PolicyError):
+        serve(rig.deps, rig.policy, clock=rig.clock, sleep=lambda _s: None)

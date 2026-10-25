@@ -68,6 +68,7 @@ class FakeOllama:
 
     @property
     def url(self) -> str:
+        """The server's base URL, for the job's `ollama_env` variable."""
         if self._server is None:
             raise RuntimeError("FakeOllama not started")
         return f"http://127.0.0.1:{self._server.server_address[1]}"

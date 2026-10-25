@@ -37,8 +37,13 @@ class Host:
 
 
 def run_argv(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
-    """Run an argv list with output captured and a 30 s timeout."""
-    return subprocess.run(list(argv), capture_output=True, text=True, timeout=30, check=False)
+    """Run an argv list with a 30 s timeout; a timeout is exit 124 and a missing binary exit 127, never a raise."""
+    try:
+        return subprocess.run(list(argv), capture_output=True, text=True, timeout=30, check=False)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(list(argv), 124, "", "timeout")
+    except FileNotFoundError as exc:
+        return subprocess.CompletedProcess(list(argv), 127, "", str(exc))
 
 
 def _http_status(url: str, timeout_s: float) -> int:
@@ -58,11 +63,11 @@ def driver_ok(host: Host) -> bool:
     """True when the loaded module equals the installed package's upstream version and nvidia-smi works."""
     try:
         loaded = host.read_text(MODULE_VERSION_FILE).strip()
-        pkg = host.run(["dpkg-query", "-W", "-f=${Version}", DRIVER_PACKAGE])
+        pkg = host.run(["dpkg-query", "-W", "-f=${Version}\\n", DRIVER_PACKAGE])
         if pkg.returncode != 0:
             return False
-        installed = pkg.stdout.strip().split("-", 1)[0]
-        if not loaded or not installed or loaded != installed:
+        installed = {line.split("-", 1)[0] for line in pkg.stdout.split() if line}
+        if not loaded or installed != {loaded}:
             return False
         return host.run(["nvidia-smi"]).returncode == 0
     except OSError:
@@ -115,9 +120,14 @@ def host_idle_reason(host: Host, ollama_url: str = OLLAMA_URL) -> str | None:
         return idle_reason("driver-mismatch")
     if not ollama_ok(host, ollama_url):
         return idle_reason("ollama-down")
-    foreign = foreign_gpu_process(host)
+    try:
+        foreign = foreign_gpu_process(host)
+    except CheckError:
+        return idle_reason("driver-mismatch")
     if foreign is not None:
         return idle_reason("gpu-foreign", foreign)
-    if mem_available_bytes(host) < MIN_AVAILABLE_BYTES:
-        return idle_reason("low-memory")
-    return None
+    try:
+        enough = mem_available_bytes(host) >= MIN_AVAILABLE_BYTES
+    except CheckError:
+        enough = False
+    return None if enough else idle_reason("low-memory")

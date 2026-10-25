@@ -14,6 +14,7 @@ PACKAGE = Path(__file__).resolve().parent.parent / "fucone"
 CLOCK_CALLS = {
     ("time", "time"),
     ("time", "monotonic"),
+    ("time", "perf_counter"),
     ("datetime", "now"),
     ("datetime", "utcnow"),
     ("date", "today"),
@@ -33,22 +34,32 @@ def sudo_violations(name: str, text: str) -> list[str]:
     for node in ast.walk(ast.parse(text)):
         if isinstance(node, ast.Constant) and node.value in {"sudo", "pkexec"}:
             found.append(f"{name}:{node.lineno}: {node.value!r}")
-        if isinstance(node, ast.List):
+        if isinstance(node, ast.List | ast.Tuple):
             items = [e.value for e in node.elts if isinstance(e, ast.Constant)]
             if items and items[0] in {"systemctl", "systemd-run"} and "--user" not in items:
                 found.append(f"{name}:{node.lineno}: {items}")
     return found
 
 
+def _owner(node: ast.expr) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    return node.attr if isinstance(node, ast.Attribute) else None
+
+
 def clock_violations(name: str, text: str) -> list[str]:
-    """Attribute uses such as datetime.now or time.time."""
-    return [
-        f"{name}:{node.lineno}: {node.value.id}.{node.attr}"
-        for node in ast.walk(ast.parse(text))
-        if isinstance(node, ast.Attribute)
-        and isinstance(node.value, ast.Name)
-        and (node.value.id, node.attr) in CLOCK_CALLS
-    ]
+    """Clock reads: datetime.now, datetime.datetime.now, time.time, or importing such a function directly."""
+    found = []
+    for node in ast.walk(ast.parse(text)):
+        if isinstance(node, ast.Attribute) and (_owner(node.value), node.attr) in CLOCK_CALLS:
+            found.append(f"{name}:{node.lineno}: {_owner(node.value)}.{node.attr}")
+        if isinstance(node, ast.ImportFrom) and node.module in {"time", "datetime"}:
+            found += [
+                f"{name}:{node.lineno}: from {node.module} import {a.name}"
+                for a in node.names
+                if (node.module, a.name) in CLOCK_CALLS
+            ]
+    return found
 
 
 def test_scanners_catch_violations() -> None:
@@ -58,6 +69,12 @@ def test_scanners_catch_violations() -> None:
     assert not sudo_violations("x.py", 'run(["systemctl", "--user", "stop", "u"])')
     assert clock_violations("x.py", "t = datetime.now(UTC)")
     assert clock_violations("x.py", "t = time.time()")
+    assert clock_violations("x.py", "t = datetime.datetime.now()")
+    assert clock_violations("x.py", "from time import monotonic")
+    assert sudo_violations("x.py", 'run(("sudo", "ls"))')
+    assert not clock_violations(
+        "x.py", "from datetime import UTC, datetime\nt = datetime(2026, 1, 1)"
+    )
 
 
 def test_invariant_never_sudo() -> None:

@@ -227,3 +227,15 @@ def test_reset_refuses_while_the_dispatcher_lock_is_held(paths: StatePaths) -> N
     with DispatcherLock(paths.lock), pytest.raises(LockHeld):
         reset(paths)
     assert paths.db.exists()
+
+
+def test_ack_of_a_run_from_an_older_manifest_entry_leaves_the_job_alone(paths: StatePaths) -> None:
+    state = open_state(paths)
+    state.insert_run(
+        RunRow("r1", "torra/bench", "fp-old", "awaiting-review", "2026-10-24T01:00:00+00:00")
+    )
+    state.upsert_job(JobRow("torra/bench", "fp-new", "pending"))
+    state.ack("r1", T0)
+    run, job = state.get_run("r1"), state.get_job("torra/bench")
+    assert run is not None and run.status == "done"
+    assert job is not None and job.status == "pending"

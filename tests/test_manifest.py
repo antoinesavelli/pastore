@@ -170,3 +170,9 @@ def test_parse_duration(value: object, seconds: int) -> None:
 def test_parse_duration_refuses(value: object) -> None:
     with pytest.raises(ManifestError):
         parse_duration(value)
+
+
+def test_fingerprint_changes_with_the_consumer_root(tmp_path: Path) -> None:
+    one = load_manifest(write(make_root(tmp_path / "a"), TASK), "torra", fake_which)
+    two = load_manifest(write(make_root(tmp_path / "b"), TASK), "torra", fake_which)
+    assert one["bench"].fingerprint != two["bench"].fingerprint

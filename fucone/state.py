@@ -23,6 +23,7 @@ DISPATCHER_EVENTS = (
     "policy-error",
     "run-start",
     "run-end",
+    "tick-error",
 )
 SCHEMA = """
 CREATE TABLE jobs(
@@ -285,6 +286,11 @@ class State:
         )
         return None if row is None else RunRow(*row)
 
+    def jobs_with_status(self, status: str) -> list[JobRow]:
+        """Every job in this status."""
+        rows = self._conn.execute("SELECT * FROM jobs WHERE status=? ORDER BY ref", (status,))
+        return [JobRow(*row) for row in rows]
+
     def runs_with_status(self, status: str) -> list[RunRow]:
         """Every run in this status, oldest first."""
         rows = self._conn.execute(
@@ -342,14 +348,17 @@ class State:
             raise StateError(f"no job {ref} in state")
 
     def ack(self, run_id: str, now: datetime) -> None:
-        """Accept a run awaiting review: the run and its job become done."""
+        """Accept a run awaiting review: the run becomes done, and its job too unless the manifest entry changed since."""
         run = self.get_run(run_id)
         if run is None or run.status != "awaiting-review":
             state = "no such run" if run is None else f"status {run.status}"
             raise StateError(f"run {run_id} is not awaiting review ({state})")
         with self._conn:
             self._conn.execute("UPDATE runs SET status='done' WHERE run_id=?", (run_id,))
-            self._conn.execute("UPDATE jobs SET status='done' WHERE ref=?", (run.ref,))
+            self._conn.execute(
+                "UPDATE jobs SET status='done' WHERE ref=? AND fingerprint=?",
+                (run.ref, run.fingerprint),
+            )
             self._event(now, "done", run.ref, f"acked {run_id}")
 
 

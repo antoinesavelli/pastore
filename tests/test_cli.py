@@ -1,16 +1,19 @@
-"""Pins the CLI surface: the add gate, remove, status, stop, check, rerun/ack/reset and the not-wired commands.
+"""Pins the CLI surface: the add gate, remove, status, stop, check, rerun/ack/reset, run-now and contract gates, start wiring.
 
-Depends on: fucone.cli, fucone.state, fucone.manifest, tests.fakes and pytest only.
+Depends on: fucone.cli, fucone.dispatcher (Deps), fucone.policy, fucone.state, fucone.manifest, tests.fakes.
 """
 
 import io
+import stat
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-from fucone.cli import main
+from fucone import cli
+from fucone.cli import _run_in, main
+from fucone.dispatcher import Deps
 from fucone.manifest import load_manifest
 from fucone.policy import load_policy
 from fucone.state import DispatcherLock, JobRow, RunRow, default_paths, open_state
@@ -248,3 +251,54 @@ def test_policy_flag_overrides_default(
     bad.write_text("version: 7\n")
     assert env.run("--policy", str(bad), "add", "torra/bench", "--yes")[0] == 1
     assert "version must be 1" in capsys.readouterr().err
+
+
+def _list_bench(env: Env) -> None:
+    env.policy.write_text(env.policy.read_text().replace("jobs: []", "jobs:\n  - torra/bench"))
+
+
+def test_run_now_needs_a_contract_pass_and_a_pending_job(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _list_bench(env)
+    assert env.run("run-now", "torra/bench")[0] == 1
+    assert "no contract pass" in capsys.readouterr().err
+    env.pass_contract()
+    assert env.run("run-now", "torra/bench")[0] == 1
+    assert "dispatcher-down" in capsys.readouterr().err
+
+
+def test_contract_refuses_while_the_dispatcher_holds_the_lock(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env.paths.state_dir.mkdir(parents=True)
+    with DispatcherLock(env.paths.lock):
+        assert env.run("check", "--contract", "torra/bench")[0] == 1
+    assert "stop it first" in capsys.readouterr().err
+
+
+def test_add_keeps_the_policy_file_mode(env: Env) -> None:
+    env.pass_contract()
+    env.policy.chmod(0o644)
+    assert env.run("add", "torra/bench", "--yes")[0] == 0
+    assert stat.S_IMODE(env.policy.stat().st_mode) == 0o644
+
+
+def test_run_in_turns_a_missing_binary_into_exit_127(tmp_path: Path) -> None:
+    result = _run_in([str(tmp_path / "nope")], tmp_path, {"PATH": "/usr/bin"})
+    assert result.returncode == 127
+
+
+def test_start_binds_system_local_time_and_the_real_environment(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, Deps] = {}
+
+    def fake_serve(deps: Deps, policy_path: Path, **_kw: object) -> int:
+        seen["deps"] = deps
+        return 0
+
+    monkeypatch.setattr(cli, "serve", fake_serve)
+    assert env.run("start")[0] == 0
+    assert seen["deps"].local_tz is None
+    assert seen["deps"].paths == env.paths

@@ -1,6 +1,6 @@
 """The dispatcher: each tick heartbeats, honours stop and run-now requests, watches the running job, or starts the next.
 
-Depends on: policy (PolicyCache), manifest, state (State, rows, lock), window, checks (Host), runner, spec.
+Depends on: policy (PolicyCache), manifest, state (State, rows, lock), window, checks (Host), runner, contract (Started), spec.
 """
 
 import sys
@@ -15,7 +15,7 @@ from fucone.checks import Host, host_idle_reason, stopped
 from fucone.contract import Started
 from fucone.manifest import ManifestError
 from fucone.policy import Policy, PolicyCache
-from fucone.runner import BASE_ENV_KEYS, RunDir, make_run_dir, new_run_id, stop_leftovers
+from fucone.runner import BASE_ENV_KEYS, RunDir, fresh_run_dir, stop_leftovers
 from fucone.spec import RunReader, TaskSpec, idle_reason
 from fucone.state import DispatcherLock, JobRow, RunRow, State, StatePaths, open_state
 from fucone.window import in_window
@@ -80,6 +80,9 @@ class Dispatcher:
             job = self.state.get_job(run.ref)
             if job is not None:
                 self.state.upsert_job(_charge_crash(job))
+        for job in self.state.jobs_with_status("running"):
+            if job.ref not in crashed:
+                self.state.upsert_job(replace(job, status="pending"))
         self.state.reset_crash_streaks(crashed)
         self.state.record_event(now, "recover", detail=",".join(sorted(crashed)))
 
@@ -180,6 +183,8 @@ class Dispatcher:
         ready = [forced] if forced else [s for s in specs if self._is_ready(now, s)]
         reason = self._idle_reason(now, policy, ready, forced is not None)
         if reason is not None:
+            if forced is not None:
+                self.state.record_event(now, "refused", forced.ref, f"run-now: {reason}")
             self.state.set_idle_reason(now, reason)
             return
         self.state.clear_idle_reason()
@@ -190,9 +195,10 @@ class Dispatcher:
         if ref is None:
             return None
         self.state.clear_run_now()
-        match = [s for s in specs if s.ref == ref]
+        match = [s for s in specs if s.ref == ref and self._job(s).status == "pending"]
         if not match:
-            self.state.record_event(now, "refused", ref, "run-now: not listed or not runnable")
+            detail = "run-now: not listed, no contract pass, or not pending (use rerun first)"
+            self.state.record_event(now, "refused", ref, detail)
         return match[0] if match else None
 
     def _idle_reason(
@@ -278,21 +284,29 @@ class Dispatcher:
             self.state.record_event(now, "starved", job.ref, f"ready since {job.ready_since}")
 
     def _start(self, now: datetime, spec: TaskSpec) -> None:
-        run_id, run_dir = self._new_run_dir(now)
-        handle = self.deps.start(spec, run_dir, run_id, self.deps.ollama_url, self.deps.base_env)
+        run_id, run_dir = fresh_run_dir(self.deps.paths.runs_dir, now)
         self.state.insert_run(RunRow(run_id, spec.ref, spec.fingerprint, "running", iso(now)))
         self.state.upsert_job(replace(self._job(spec), status="running"))
         self.state.record_event(now, "run-start", spec.ref, run_id)
+        try:
+            handle = self.deps.start(
+                spec, run_dir, run_id, self.deps.ollama_url, self.deps.base_env
+            )
+        except OSError as exc:
+            self._finish(Active(spec, run_id, run_dir, now, _NoHandle()), now, 127, False)
+            self.state.record_event(now, "refused", spec.ref, f"could not start: {exc}")
+            return
         self.active = Active(spec, run_id, run_dir, now, handle)
 
-    def _new_run_dir(self, now: datetime) -> tuple[str, RunDir]:
-        for seq in range(1, 1000):
-            run_id = new_run_id(now, seq)
-            try:
-                return run_id, make_run_dir(self.deps.paths.runs_dir, run_id)
-            except FileExistsError:
-                continue
-        raise RuntimeError(f"no free run id at {iso(now)}")
+
+class _NoHandle:
+    """Stands in for a run whose process never started."""
+
+    def poll(self) -> int | None:
+        return 127
+
+    def stop(self, run: object, wait_s: float = 30.0) -> int:
+        return 127
 
 
 def _charge_crash(job: JobRow) -> JobRow:
@@ -319,8 +333,28 @@ def serve(
 
         dispatcher = Dispatcher(deps, state, PolicyCache(policy_path, log))
         dispatcher.policy.current()
+        stale = [state.stop_requested(), state.run_now_requested()]
+        state.clear_stop()
+        state.clear_run_now()
         dispatcher.recover(clock())
-        state.record_event(clock(), "dispatcher-start")
-        while dispatcher.tick(clock()):
+        dropped = [r for r in stale if r is not None]
+        state.record_event(
+            clock(), "dispatcher-start", detail=f"dropped stale {dropped}" if dropped else ""
+        )
+        while _guarded_tick(dispatcher, state, clock):
             sleep(tick_s)
     return 0
+
+
+def _guarded_tick(dispatcher: Dispatcher, state: State, clock: Callable[[], datetime]) -> bool:
+    """One tick; an unexpected error is logged as a tick-error event and the loop goes on."""
+    try:
+        return dispatcher.tick(clock())
+    except Exception as exc:  # noqa: BLE001 — the night must not end on one bad tick; the error is recorded
+        message = f"{type(exc).__name__}: {exc}"
+        print(f"tick-error: {message}", file=sys.stderr)
+        try:
+            state.record_event(clock(), "tick-error", detail=message)
+        except Exception as inner:  # noqa: BLE001 — state itself failing must still not kill the loop
+            print(f"tick-error not recorded: {inner}", file=sys.stderr)
+        return True

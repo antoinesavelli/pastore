@@ -41,6 +41,17 @@ def new_run_id(now: datetime, seq: int) -> str:
     return now.astimezone(UTC).strftime("%Y%m%dT%H%M%S") + f"-{seq}"
 
 
+def fresh_run_dir(runs_dir: Path, now: datetime, suffix: str = "") -> tuple[str, RunDir]:
+    """The first free `<UTC stamp>-<seq><suffix>` run id and its new directory."""
+    for seq in range(1, 1000):
+        run_id = new_run_id(now, seq) + suffix
+        try:
+            return run_id, make_run_dir(runs_dir, run_id)
+        except FileExistsError:
+            continue
+    raise RuntimeError(f"no free run id under {runs_dir} at {now.isoformat()}")
+
+
 def make_run_dir(runs_dir: Path, run_id: str) -> RunDir:
     """Create `runs_dir/run_id/out`; an existing run directory is an error."""
     root = runs_dir / run_id
@@ -61,8 +72,8 @@ def job_env(
     return env
 
 
-def scope_argv(run_id: str, argv: Sequence[str]) -> list[str]:
-    """Wrap argv in a transient user scope inside heavy-jobs.slice."""
+def scope_argv(run_id: str, argv: Sequence[str], timeout_s: int) -> list[str]:
+    """Wrap argv in a transient user scope inside heavy-jobs.slice; systemd kills it at timeout_s even if fucone dies."""
     return [
         "systemd-run",
         "--user",
@@ -72,6 +83,8 @@ def scope_argv(run_id: str, argv: Sequence[str]) -> list[str]:
         f"--unit=fucone-{run_id}",
         "-p",
         "CPUWeight=20",
+        "-p",
+        f"RuntimeMaxSec={timeout_s}",
         "--",
         *argv,
     ]
@@ -106,12 +119,12 @@ def start_run(
     base_env: Mapping[str, str],
     *,
     popen: Callable[..., PopenLike] = subprocess.Popen,
-    wrap: Callable[[str, Sequence[str]], list[str]] = scope_argv,
+    wrap: Callable[[str, Sequence[str], int], list[str]] = scope_argv,
 ) -> RunHandle:
     """Start the job in its own session with logs beside the run's out/ directory."""
     with run_dir.stdout.open("wb") as out_log, run_dir.stderr.open("wb") as err_log:
         proc = popen(
-            wrap(run_id, spec.argv),
+            wrap(run_id, spec.argv, spec.timeout_s),
             cwd=spec.cwd,
             env=job_env(spec, run_dir, ollama_url, base_env),
             stdout=out_log,
