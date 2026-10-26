@@ -48,7 +48,7 @@ def test_load_valid_policy(tmp_path: Path) -> None:
 
 def test_repo_policy_loads_and_render_keeps_its_header() -> None:
     policy = load_policy(REPO_POLICY)
-    assert policy.consumers == {} and policy.jobs == ()
+    assert all(job.split("/")[0] in policy.consumers for job in policy.jobs)
     header = "".join(REPO_POLICY.read_text().splitlines(keepends=True)[:2])
     assert render_policy(policy).startswith(header)
 
