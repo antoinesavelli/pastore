@@ -1,0 +1,6 @@
+# Never committed: the dispatcher state lives in ~/.local/state/fucone (docs/DESIGN.md §1 State); run output goes to FUCONE_RUN_DIR outside every repo (D-006).
+*.db
+*.db-wal
+*.db-shm
+dispatcher.lock
+*/dispatcher.lock
