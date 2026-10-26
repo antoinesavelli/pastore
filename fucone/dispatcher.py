@@ -3,6 +3,7 @@
 Depends on: policy (PolicyCache), manifest, state (State, rows, lock), window, checks (Host), runner, contract (Started), spec.
 """
 
+import signal
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import closing
@@ -10,6 +11,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
 from subprocess import CompletedProcess
+from types import FrameType
 
 from fucone.checks import Host, host_idle_reason, stopped
 from fucone.contract import Started
@@ -68,6 +70,7 @@ class Dispatcher:
         self.policy = policy
         self.active: Active | None = None
         self.draining = False
+        self.terminated = False
         self._refused: set[tuple[str, str]] = set()
 
     def recover(self, now: datetime) -> None:
@@ -101,10 +104,10 @@ class Dispatcher:
         return True
 
     def _handle_stop_request(self, now: datetime) -> bool:
-        mode = self.state.stop_requested()
+        mode = "sigterm" if self.terminated else self.state.stop_requested()
         if mode is None:
             return True
-        if mode == "now" and self.active is not None:
+        if mode != "graceful" and self.active is not None:
             self._stop_active(now)
         self.draining = True
         self.state.clear_stop()
@@ -333,6 +336,11 @@ def serve(
 
         dispatcher = Dispatcher(deps, state, PolicyCache(policy_path, log))
         dispatcher.policy.current()
+
+        def on_sigterm(_signum: int, _frame: FrameType | None) -> None:
+            dispatcher.terminated = True  # the next tick stops; a handler must not touch sqlite
+
+        previous = signal.signal(signal.SIGTERM, on_sigterm)
         stale = [state.stop_requested(), state.run_now_requested()]
         state.clear_stop()
         state.clear_run_now()
@@ -341,8 +349,11 @@ def serve(
         state.record_event(
             clock(), "dispatcher-start", detail=f"dropped stale {dropped}" if dropped else ""
         )
-        while _guarded_tick(dispatcher, state, clock):
-            sleep(tick_s)
+        try:
+            while _guarded_tick(dispatcher, state, clock):
+                sleep(tick_s)
+        finally:
+            signal.signal(signal.SIGTERM, previous)
     return 0
 
 

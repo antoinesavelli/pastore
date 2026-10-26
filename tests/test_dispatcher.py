@@ -3,6 +3,8 @@
 Depends on: fucone.dispatcher with a fake Host, fake handles and a FakeClock; one end-to-end run uses real start_run.
 """
 
+import os
+import signal
 import sys
 import time
 from collections.abc import Mapping, Sequence
@@ -482,6 +484,27 @@ def test_serve_recovers_drops_stale_requests_and_stops_on_request(tmp_path: Path
     assert serve(rig.deps, rig.policy, clock=rig.clock, sleep=sleep) == 0
     assert len(sleeps) == 3
     assert rig.events("recover") and "dropped stale" in rig.events("dispatcher-start")[0].detail
+
+
+def test_sigterm_stops_now_logs_the_stop_and_restores_the_handler(tmp_path: Path) -> None:
+    rig = Rig(tmp_path, [task(tmp_path, "a")], ["c/a"])
+    rig.next_codes = [None, None, None]
+    before = signal.getsignal(signal.SIGTERM)
+    sleeps: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        rig.clock.advance(seconds)
+        if len(sleeps) == 2:
+            os.kill(os.getpid(), signal.SIGTERM)
+
+    assert serve(rig.deps, rig.policy, clock=rig.clock, sleep=sleep) == 0
+    assert len(sleeps) == 2
+    assert [e.detail for e in rig.events("dispatcher-stop")] == ["sigterm"]
+    job = rig.state.get_job("c/a")
+    assert rig.handles[0].stopped and job is not None and job.status == "pending"
+    assert job.attempts == 0
+    assert signal.getsignal(signal.SIGTERM) is before
 
 
 def test_serve_refuses_a_bad_policy_and_a_held_lock(tmp_path: Path) -> None:
