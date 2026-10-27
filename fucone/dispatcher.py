@@ -3,6 +3,7 @@
 Depends on: policy (PolicyCache), manifest, state (State, rows, lock), window, checks (Host), runner, contract (Started), spec.
 """
 
+import math
 import signal
 import sys
 from collections.abc import Callable, Mapping, Sequence
@@ -107,11 +108,12 @@ class Dispatcher:
         mode = "sigterm" if self.terminated else self.state.stop_requested()
         if mode is None:
             return True
+        # Logged first: on shutdown, systemd may SIGKILL us while the job is being stopped.
+        self.state.record_event(now, "dispatcher-stop", detail=mode)
         if mode != "graceful" and self.active is not None:
             self._stop_active(now)
         self.draining = True
         self.state.clear_stop()
-        self.state.record_event(now, "dispatcher-stop", detail=mode)
         return self.active is not None
 
     def _stop_active(self, now: datetime) -> None:
@@ -338,7 +340,7 @@ def serve(
         dispatcher.policy.current()
 
         def on_sigterm(_signum: int, _frame: FrameType | None) -> None:
-            dispatcher.terminated = True  # the next tick stops; a handler must not touch sqlite
+            dispatcher.terminated = True  # `_nap` wakes within 1 s; a handler must not touch sqlite
 
         previous = signal.signal(signal.SIGTERM, on_sigterm)
         stale = [state.stop_requested(), state.run_now_requested()]
@@ -351,10 +353,18 @@ def serve(
         )
         try:
             while _guarded_tick(dispatcher, state, clock):
-                sleep(tick_s)
+                _nap(dispatcher, sleep, tick_s)
         finally:
             signal.signal(signal.SIGTERM, previous)
     return 0
+
+
+def _nap(dispatcher: Dispatcher, sleep: Callable[[float], None], tick_s: float) -> None:
+    """Sleep one tick in 1 s steps, so a SIGTERM is acted on before a shutdown's SIGKILL."""
+    for _ in range(math.ceil(tick_s)):
+        if dispatcher.terminated:
+            return
+        sleep(1.0)
 
 
 def _guarded_tick(dispatcher: Dispatcher, state: State, clock: Callable[[], datetime]) -> bool:

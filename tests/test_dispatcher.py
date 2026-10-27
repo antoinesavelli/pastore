@@ -481,7 +481,7 @@ def test_serve_recovers_drops_stale_requests_and_stops_on_request(tmp_path: Path
         if len(sleeps) == 3:
             rig.state.request_stop("graceful")
 
-    assert serve(rig.deps, rig.policy, clock=rig.clock, sleep=sleep) == 0
+    assert serve(rig.deps, rig.policy, clock=rig.clock, sleep=sleep, tick_s=1.0) == 0
     assert len(sleeps) == 3
     assert rig.events("recover") and "dropped stale" in rig.events("dispatcher-start")[0].detail
 
@@ -499,8 +499,10 @@ def test_sigterm_stops_now_logs_the_stop_and_restores_the_handler(tmp_path: Path
             os.kill(os.getpid(), signal.SIGTERM)
 
     assert serve(rig.deps, rig.policy, clock=rig.clock, sleep=sleep) == 0
-    assert len(sleeps) == 2
-    assert [e.detail for e in rig.events("dispatcher-stop")] == ["sigterm"]
+    assert sleeps == [1.0, 1.0]  # woke mid-tick, not after the rest of the 30 s
+    [stop] = rig.events("dispatcher-stop")
+    [end] = rig.events("run-end")
+    assert stop.detail == "sigterm" and stop.id < end.id  # logged before the job is stopped
     job = rig.state.get_job("c/a")
     assert rig.handles[0].stopped and job is not None and job.status == "pending"
     assert job.attempts == 0
