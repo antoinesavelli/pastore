@@ -1,9 +1,10 @@
 """The pastore command line: start, stop, status, add/remove (gated), check [--contract], run-now, rerun, ack, reset.
 
-Depends on: policy, manifest, state, dispatcher (serve), contract, checks/runner real bindings; binds the real clock only here.
+Depends on: spec (Pair, TaskSpec), policy, manifest, state, dispatcher (serve), contract, checks/runner real bindings; binds the real clock only here.
 """
 
 import argparse
+import hashlib
 import os
 import sqlite3
 import stat
@@ -32,10 +33,11 @@ from pastore.policy import (
     with_job_removed,
 )
 from pastore.runner import start_run
-from pastore.spec import TaskSpec
+from pastore.spec import Pair, TaskSpec
 from pastore.state import (
     DispatcherLock,
     LockHeld,
+    State,
     StateError,
     StatePaths,
     default_paths,
@@ -43,7 +45,6 @@ from pastore.state import (
     open_state,
     reset,
 )
-from pastore.window import next_window_start
 
 HEARTBEAT_STALE = timedelta(seconds=60)
 SUBPROCESS_TIMEOUT_S = 45
@@ -71,22 +72,25 @@ def _refuse(text: str) -> int:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="pastore", description="Night-shift GPU job queue.")
+    parser = argparse.ArgumentParser(prog="pastore", description="GPU job queue.")
     parser.add_argument("--policy", type=Path, help="policy.yaml to use (default: the repo's)")
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("start")
     sub.add_parser("status")
     sub.add_parser("reset")
     sub.add_parser("stop").add_argument("--now", action="store_true")
-    for name in ("add", "remove"):
+    for name in ("add", "remove", "rerun", "run-now"):
         cmd = sub.add_parser(name)
         cmd.add_argument("ref")
-        cmd.add_argument("--yes", action="store_true")
+        cmd.add_argument("--model", required=True)
+        if name in ("add", "remove"):
+            cmd.add_argument("--yes", action="store_true")
+        if name == "add":
+            cmd.add_argument("--evidence", type=Path, required=True)
     check = sub.add_parser("check")
     check.add_argument("path", nargs="?", type=Path)
     check.add_argument("--contract", metavar="REF")
-    for name, arg in (("run-now", "ref"), ("rerun", "ref"), ("ack", "run_id")):
-        sub.add_parser(name).add_argument(arg)
+    sub.add_parser("ack").add_argument("run_id")
     return parser
 
 
@@ -98,6 +102,14 @@ def _dispatcher_up(ctx: Ctx) -> bool:
     return beat is not None and ctx.clock() - beat <= HEARTBEAT_STALE
 
 
+def _pair_line(state: State, pair: Pair) -> str:
+    """One status line for a listed pair: job status, attempts, last run, starved flag."""
+    job, run = state.get_job(pair.task, pair.model), state.last_run(pair.task, pair.model)
+    line = f"{pair.task} {pair.model}: {job.status if job else 'unseen'}"
+    line += f" attempts={job.attempts if job else 0} last_run={run.status if run else 'none'}"
+    return line + (" starved" if job and job.starved_flagged else "")
+
+
 def _status(ctx: Ctx, _args: argparse.Namespace) -> int:
     if not ctx.paths.db.exists():
         _say(ctx, "no state yet")
@@ -106,12 +118,6 @@ def _status(ctx: Ctx, _args: argparse.Namespace) -> int:
     with closing(open_state(ctx.paths, readonly=True)) as state:
         _say(ctx, f"dispatcher: {'up' if up else 'dispatcher-down'}")
         _say(ctx, f"idle: {state.idle_reason() or 'none'}")
-        if state.idle_reason() == "outside-window":
-            policy = load_policy(ctx.policy_path)
-            opens = next_window_start(
-                ctx.clock().astimezone(), policy.window_start, policy.window_end
-            )
-            _say(ctx, f"next window opens: {opens.isoformat(timespec='minutes')}")
         errors = [e for e in state.recent_events(200) if e.kind == "tick-error"]
         if errors:
             _say(ctx, f"last tick-error: {errors[0].at} {errors[0].detail}")
@@ -120,13 +126,10 @@ def _status(ctx: Ctx, _args: argparse.Namespace) -> int:
         except PolicyError as exc:
             _say(ctx, f"policy error: {exc}")
             return 1
-        for ref in jobs:
-            job, run = state.get_job(ref), state.last_run(ref)
-            line = f"{ref}: {job.status if job else 'unseen'} attempts={job.attempts if job else 0}"
-            line += f" last_run={run.status if run else 'none'}"
-            _say(ctx, line + (" starved" if job and job.starved_flagged else ""))
+        for pair in jobs:
+            _say(ctx, _pair_line(state, pair))
         for run in state.runs_with_status("awaiting-review"):
-            _say(ctx, f"awaiting review: {run.run_id} ({run.ref})")
+            _say(ctx, f"awaiting review: {run.run_id} ({run.ref} {run.model})")
     return 0
 
 
@@ -182,19 +185,28 @@ def _spec_for(policy: Policy, ref: str) -> TaskSpec:
 
 def _add(ctx: Ctx, args: argparse.Namespace) -> int:
     policy = load_policy(ctx.policy_path)
-    new = with_job_added(policy, args.ref)
-    if not _has_contract_pass(ctx, args.ref, _spec_for(policy, args.ref).fingerprint):
+    spec = _spec_for(policy, args.ref)
+    if args.model not in spec.models:
+        return _refuse(
+            f"{args.ref}: model {args.model!r} is not in its manifest models {list(spec.models)}"
+        )
+    evidence = Path(os.path.realpath(args.evidence))
+    if not evidence.is_file():
+        return _refuse(f"{evidence}: evidence must be an existing regular file")
+    if not _has_contract_pass(ctx, args.ref, spec.fingerprint):
         return _refuse(
             f"{args.ref}: no passing contract test for its current manifest entry; "
             f"run: pastore check --contract {args.ref}"
         )
-    return _confirm_and_write(ctx, new, args.yes)
+    with evidence.open("rb") as handle:
+        digest = hashlib.file_digest(handle, "sha256").hexdigest()
+    pair = Pair(args.ref, args.model, evidence, digest)
+    return _confirm_and_write(ctx, with_job_added(policy, pair), args.yes)
 
 
 def _remove(ctx: Ctx, args: argparse.Namespace) -> int:
-    return _confirm_and_write(
-        ctx, with_job_removed(load_policy(ctx.policy_path), args.ref), args.yes
-    )
+    new = with_job_removed(load_policy(ctx.policy_path), args.ref, args.model)
+    return _confirm_and_write(ctx, new, args.yes)
 
 
 def _check(ctx: Ctx, args: argparse.Namespace) -> int:
@@ -211,8 +223,8 @@ def _check(ctx: Ctx, args: argparse.Namespace) -> int:
 
 def _rerun(ctx: Ctx, args: argparse.Namespace) -> int:
     with closing(open_state(ctx.paths)) as state:
-        state.rerun(args.ref)
-    _say(ctx, f"{args.ref}: back to pending")
+        state.rerun(args.ref, args.model)
+    _say(ctx, f"{args.ref} {args.model}: back to pending")
     return 0
 
 
@@ -282,7 +294,6 @@ def _start(ctx: Ctx, _args: argparse.Namespace) -> int:
         start=start_run,
         base_env=dict(os.environ),
         ollama_url=OLLAMA_URL,
-        local_tz=None,
     )
     for attempt in range(2):
         try:
@@ -296,18 +307,24 @@ def _start(ctx: Ctx, _args: argparse.Namespace) -> int:
 
 def _run_now(ctx: Ctx, args: argparse.Namespace) -> int:
     policy = load_policy(ctx.policy_path)
-    if args.ref not in policy.jobs:
-        return _refuse(f"{args.ref}: not listed in policy.yaml; only listed jobs run")
+    if not any((p.task, p.model) == (args.ref, args.model) for p in policy.jobs):
+        return _refuse(f"{args.ref} {args.model}: not listed in policy.yaml; only listed pairs run")
     if not _has_contract_pass(ctx, args.ref, _spec_for(policy, args.ref).fingerprint):
         return _refuse(f"{args.ref}: no contract pass for its current manifest entry")
     if not _dispatcher_up(ctx):
         return _refuse("dispatcher-down: start it first (pastore start)")
     with closing(open_state(ctx.paths)) as state:
-        job = state.get_job(args.ref)
+        job = state.get_job(args.ref, args.model)
         if job is not None and job.status != "pending":
-            return _refuse(f"{args.ref}: is {job.status}; run `pastore rerun {args.ref}` first")
-        state.request_run_now(args.ref)
-    _say(ctx, f"run-now queued for {args.ref}; the dispatcher picks it up within one tick")
+            return _refuse(
+                f"{args.ref} {args.model}: is {job.status}; "
+                f"run `pastore rerun {args.ref} --model {args.model}` first"
+            )
+        state.request_run_now(args.ref, args.model)
+    _say(
+        ctx,
+        f"run-now queued for {args.ref} {args.model}; the dispatcher picks it up within one tick",
+    )
     return 0
 
 

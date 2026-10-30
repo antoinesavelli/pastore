@@ -19,6 +19,7 @@ TASK = """  - id: bench
     timeout: 2h
     resumable: true
     ollama_env: OLLAMA_HOST
+    model_env: PASTORE_MODEL
     reader: {run: [.venv/bin/python, read.py]}
 """
 OTHER = TASK.replace("id: bench", "id: second")
@@ -53,6 +54,14 @@ def test_valid_manifest_builds_task_specs(tmp_path: Path) -> None:
     assert spec.models == ("qwen3:8b",) and spec.env == {"MODE": "fast"}
     assert spec.reader == RunReader((".venv/bin/python", "read.py")) and spec.ready is None
     assert len(spec.fingerprint) == 64
+
+
+def test_model_env_lands_in_the_task_spec(tmp_path: Path) -> None:
+    root = make_root(tmp_path)
+    spec = load_manifest(
+        write(root, TASK.replace("PASTORE_MODEL", "BENCH_MODEL")), "torra", fake_which
+    )["bench"]
+    assert spec.model_env == "BENCH_MODEL" and spec.ollama_env == "OLLAMA_HOST"
 
 
 def test_validate_reader_and_ready_rule(tmp_path: Path) -> None:
@@ -94,6 +103,15 @@ def test_bare_names_must_be_allowed_and_found(tmp_path: Path) -> None:
         )
 
 
+def test_model_env_changes_the_fingerprint(tmp_path: Path) -> None:
+    root = make_root(tmp_path)
+    before = load_manifest(write(root, TASK), "torra", fake_which)["bench"]
+    after = load_manifest(
+        write(root, TASK.replace("PASTORE_MODEL", "BENCH_MODEL")), "torra", fake_which
+    )["bench"]
+    assert before.fingerprint != after.fingerprint
+
+
 def test_fingerprint_is_per_task_entry(tmp_path: Path) -> None:
     root = make_root(tmp_path)
     before = load_manifest(write(root, TASK + OTHER), "torra", fake_which)
@@ -112,6 +130,19 @@ def test_fingerprint_is_per_task_entry(tmp_path: Path) -> None:
         ("    resumable: true\n", "", "resumable must be literally true"),
         ("    ollama_env: OLLAMA_HOST\n", "", "ollama_env must match"),
         ("ollama_env: OLLAMA_HOST", "ollama_env: ollama-host", "ollama_env must match"),
+        ("    model_env: PASTORE_MODEL\n", "", "model_env must match"),
+        ("model_env: PASTORE_MODEL", "model_env: pastore-model", "model_env must match"),
+        ("model_env: PASTORE_MODEL", "model_env: PASTORE-MODEL", "model_env must match"),
+        ("model_env: PASTORE_MODEL", "model_env: 7", "model_env must match"),
+        ("model_env: PASTORE_MODEL", "model_env: OLLAMA_HOST", "model_env 'OLLAMA_HOST' may not"),
+        (
+            "ollama_env: OLLAMA_HOST\n    model_env: PASTORE_MODEL",
+            "ollama_env: MY_OLLAMA\n    model_env: MY_OLLAMA",
+            "model_env 'MY_OLLAMA' may not",
+        ),
+        ("model_env: PASTORE_MODEL", "model_env: PASTORE_RUN_DIR", "model_env 'PASTORE_RUN_DIR'"),
+        ("model_env: PASTORE_MODEL", "model_env: FUCONE_RUN_DIR", "model_env 'FUCONE_RUN_DIR'"),
+        ("env: {MODE: fast}", "env: {PASTORE_MODEL: x}", r"env may not set \['PASTORE_MODEL'\]"),
         ("    model: qwen3:8b\n", "", "exactly one of model or models"),
         ("model: qwen3:8b", "model: a\n    models: [b]", "exactly one of model or models"),
         ("timeout: 2h", "timeout: 0", "duration"),
@@ -142,6 +173,20 @@ def test_invalid_entries_are_refused_with_task_prefix(
     assert str(info.value).startswith("bench: ")
 
 
+def test_invalid_env_names_do_not_reserve_the_empty_key(tmp_path: Path) -> None:
+    entry = (
+        TASK.replace("env: {MODE: fast}", 'env: {"": x}')
+        .replace("ollama_env: OLLAMA_HOST", "ollama_env: bad")
+        .replace("PASTORE_MODEL", "bad")
+    )
+    with pytest.raises(ManifestError) as info:
+        load(make_root(tmp_path), entry)
+    assert str(info.value).splitlines() == [
+        "bench: ollama_env must match [A-Z_][A-Z0-9_]*",
+        "bench: model_env must match [A-Z_][A-Z0-9_]*",
+    ]
+
+
 def test_file_level_problems_and_all_errors_listed(tmp_path: Path) -> None:
     root = make_root(tmp_path)
     with pytest.raises(ManifestError, match="duplicate id"):
@@ -154,11 +199,14 @@ def test_file_level_problems_and_all_errors_listed(tmp_path: Path) -> None:
         load_manifest(root / "gpu-tasks.yaml", "t", fake_which)
     with pytest.raises(ManifestError, match="cannot read"):
         load_manifest(root / "missing.yaml", "t", fake_which)
-    broken = TASK.replace("resumable: true", "resumable: no") + OTHER.replace("2h", "xx")
+    broken = TASK.replace("resumable: true", "resumable: no").replace(
+        "PASTORE_MODEL", "bad"
+    ) + OTHER.replace("2h", "xx")
     with pytest.raises(ManifestError) as info:
         load(root, broken)
     lines = str(info.value).splitlines()
     assert any(line.startswith("bench: resumable") for line in lines)
+    assert any(line.startswith("bench: model_env must match") for line in lines)
     assert any(line.startswith("second: duration") for line in lines)
 
 

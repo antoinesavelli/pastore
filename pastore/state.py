@@ -1,9 +1,10 @@
 """SQLite WAL state (jobs, runs, events, contracts, meta), the dispatcher flock, and reset.
 
-Depends on: pastore.spec and stdlib (sqlite3, fcntl) only; never reads a clock.
+Depends on: pastore.spec and stdlib (sqlite3, fcntl, json) only; never reads a clock.
 """
 
 import fcntl
+import json
 import os
 import sqlite3
 from dataclasses import astuple, dataclass
@@ -14,7 +15,7 @@ from typing import Any, Literal, Self
 
 from pastore.spec import TASK_EVENTS, idle_reason
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DISPATCHER_EVENTS = (
     "idle",
     "dispatcher-start",
@@ -27,12 +28,13 @@ DISPATCHER_EVENTS = (
 )
 SCHEMA = """
 CREATE TABLE jobs(
-    ref TEXT PRIMARY KEY, fingerprint TEXT NOT NULL,
+    ref TEXT NOT NULL, model TEXT NOT NULL, fingerprint TEXT NOT NULL,
     status TEXT NOT NULL CHECK(status IN ('pending','running','done','failed','blocked')),
     attempts INT NOT NULL, crash_streak INT NOT NULL, ready_since TEXT, last_check_at TEXT,
-    last_success_at TEXT, starved_flagged INT NOT NULL);
+    last_success_at TEXT, starved_flagged INT NOT NULL, PRIMARY KEY(ref, model));
 CREATE TABLE runs(
-    run_id TEXT PRIMARY KEY, ref TEXT NOT NULL, fingerprint TEXT NOT NULL,
+    run_id TEXT PRIMARY KEY, ref TEXT NOT NULL, model TEXT NOT NULL, host TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
     status TEXT NOT NULL CHECK(status IN ('running','ok','failed','timeout','stopped','crashed',
         'reader-failed','awaiting-review','done')),
     started_at TEXT NOT NULL, ended_at TEXT, exit_code INT, detail TEXT NOT NULL);
@@ -79,9 +81,10 @@ def default_paths(home: Path) -> StatePaths:
 
 @dataclass(frozen=True)
 class JobRow:
-    """One row of `jobs`."""
+    """One row of `jobs`, keyed by task ref and model."""
 
     ref: str
+    model: str
     fingerprint: str
     status: str
     attempts: int = 0
@@ -98,6 +101,8 @@ class RunRow:
 
     run_id: str
     ref: str
+    model: str
+    host: str
     fingerprint: str
     status: str
     started_at: str
@@ -123,15 +128,13 @@ def _iso(now: datetime) -> str:
     return now.astimezone(UTC).isoformat()
 
 
-def _user_version(conn: sqlite3.Connection) -> int:
-    return int(conn.execute("PRAGMA user_version").fetchone()[0])
-
-
 def _check_version(conn: sqlite3.Connection, paths: StatePaths) -> bool:
     """Return True for a brand-new database; raise StateError on any other version mismatch."""
-    version = _user_version(conn)
-    empty = conn.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()[0] == 0
-    if version == 0 and empty:
+    version, tables = conn.execute(
+        "SELECT (SELECT user_version FROM pragma_user_version), "
+        "(SELECT COUNT(*) FROM sqlite_master)"
+    ).fetchone()
+    if version == 0 and tables == 0:
         return True
     if version != SCHEMA_VERSION:
         conn.close()
@@ -142,21 +145,40 @@ def _check_version(conn: sqlite3.Connection, paths: StatePaths) -> bool:
     return False
 
 
+def _connect_ro(paths: StatePaths) -> sqlite3.Connection:
+    return sqlite3.connect(f"{paths.db.resolve().as_uri()}?mode=ro", uri=True)
+
+
+def _create_schema(conn: sqlite3.Connection) -> None:
+    """Create every table and set the version in one transaction, so a crash leaves it empty or complete."""
+    try:
+        conn.executescript(f"BEGIN;{SCHEMA}PRAGMA user_version={SCHEMA_VERSION};COMMIT;")
+    except sqlite3.Error:
+        conn.close()
+        raise
+
+
 def open_state(paths: StatePaths, *, readonly: bool = False) -> "State":
-    """Open (and on first use create) the state database; readonly never writes."""
+    """Open (and on first use create) the state database; a version mismatch is refused before any write."""
     if readonly:
         if not paths.db.exists():
             raise StateError("no state yet")
-        conn = sqlite3.connect(f"{paths.db.resolve().as_uri()}?mode=ro", uri=True)
-        _check_version(conn, paths)
+        conn = _connect_ro(paths)
+        if _check_version(conn, paths):
+            conn.close()
+            raise StateError("no state yet")
     else:
         paths.state_dir.mkdir(parents=True, exist_ok=True)
+        if paths.db.exists():
+            probe = _connect_ro(paths)
+            _check_version(probe, paths)
+            probe.close()
         conn = sqlite3.connect(paths.db)
         conn.execute("PRAGMA busy_timeout=5000")
         is_new = _check_version(conn, paths)
         conn.execute("PRAGMA journal_mode=WAL")
         if is_new:
-            conn.executescript(SCHEMA + f"PRAGMA user_version={SCHEMA_VERSION};")
+            _create_schema(conn)
     conn.execute("PRAGMA busy_timeout=5000")
     return State(conn)
 
@@ -245,30 +267,32 @@ class State:
         row = self._one("SELECT 1 FROM contracts WHERE ref=? AND fingerprint=?", (ref, fingerprint))
         return row is not None
 
-    def get_job(self, ref: str) -> JobRow | None:
-        """The job row, if any."""
-        row = self._one("SELECT * FROM jobs WHERE ref=?", (ref,))
+    def get_job(self, ref: str, model: str) -> JobRow | None:
+        """The job row for this task and model, if any."""
+        row = self._one("SELECT * FROM jobs WHERE ref=? AND model=?", (ref, model))
         return None if row is None else JobRow(*row)
 
     def upsert_job(self, job: JobRow) -> None:
-        """Insert or replace a job row."""
+        """Insert or replace the job row of this task and model."""
         with self._conn:
             self._conn.execute(
-                "INSERT OR REPLACE INTO jobs VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO jobs VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 astuple(job),
             )
 
     def insert_run(self, run: RunRow) -> None:
         """Insert a new run row."""
         with self._conn:
-            self._conn.execute("INSERT INTO runs VALUES(?, ?, ?, ?, ?, ?, ?, ?)", astuple(run))
+            self._conn.execute(
+                "INSERT INTO runs VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", astuple(run)
+            )
 
     def update_run(self, run: RunRow) -> None:
         """Replace an existing run row; StateError if it does not exist."""
         with self._conn:
             cursor = self._conn.execute(
-                "UPDATE runs SET ref=?, fingerprint=?, status=?, started_at=?, ended_at=?, "
-                "exit_code=?, detail=? WHERE run_id=?",
+                "UPDATE runs SET ref=?, model=?, host=?, fingerprint=?, status=?, started_at=?, "
+                "ended_at=?, exit_code=?, detail=? WHERE run_id=?",
                 (*astuple(run)[1:], run.run_id),
             )
         if cursor.rowcount == 0:
@@ -279,16 +303,19 @@ class State:
         row = self._one("SELECT * FROM runs WHERE run_id=?", (run_id,))
         return None if row is None else RunRow(*row)
 
-    def last_run(self, ref: str) -> RunRow | None:
-        """The most recently started run of this task, if any."""
+    def last_run(self, ref: str, model: str) -> RunRow | None:
+        """The most recently started run of this task and model, if any."""
         row = self._one(
-            "SELECT * FROM runs WHERE ref=? ORDER BY started_at DESC, run_id DESC LIMIT 1", (ref,)
+            "SELECT * FROM runs WHERE ref=? AND model=? ORDER BY started_at DESC, run_id DESC LIMIT 1",
+            (ref, model),
         )
         return None if row is None else RunRow(*row)
 
     def jobs_with_status(self, status: str) -> list[JobRow]:
-        """Every job in this status."""
-        rows = self._conn.execute("SELECT * FROM jobs WHERE status=? ORDER BY ref", (status,))
+        """Every job in this status, ordered by ref, then model."""
+        rows = self._conn.execute(
+            "SELECT * FROM jobs WHERE status=? ORDER BY ref, model", (status,)
+        )
         return [JobRow(*row) for row in rows]
 
     def runs_with_status(self, status: str) -> list[RunRow]:
@@ -314,41 +341,54 @@ class State:
         with self._conn:
             self._conn.execute("DELETE FROM meta WHERE key='stop_requested'")
 
-    def request_run_now(self, ref: str) -> None:
-        """Ask the dispatcher to start `ref` at its next tick, outside the window."""
+    def request_run_now(self, ref: str, model: str) -> None:
+        """Ask the dispatcher to start this pending job next."""
         with self._conn:
-            self._set_meta("run_now", ref)
+            self._set_meta("run_now", json.dumps([ref, model]))
 
-    def run_now_requested(self) -> str | None:
-        """The pending run-now ref, if any."""
-        return self._meta("run_now")
+    def run_now_requested(self) -> tuple[str, str] | None:
+        """The pending run-now (ref, model), if any; StateError if the stored value is corrupt."""
+        raw = self._meta("run_now")
+        if raw is None:
+            return None
+        try:
+            pair = json.loads(raw)
+        except json.JSONDecodeError:
+            pair = None
+        if not (
+            isinstance(pair, list) and len(pair) == 2 and all(isinstance(x, str) for x in pair)
+        ):
+            raise StateError(f"meta run_now is not a [ref, model] JSON list: {raw!r}")
+        return pair[0], pair[1]
 
     def clear_run_now(self) -> None:
         """Drop any pending run-now request."""
         with self._conn:
             self._conn.execute("DELETE FROM meta WHERE key='run_now'")
 
-    def reset_crash_streaks(self, except_refs: set[str]) -> None:
-        """Zero the crash streak of every job not running at this crash (D-012: only consecutive crashes count)."""
-        marks = ",".join("?" * len(except_refs))
+    def reset_crash_streaks(self, except_keys: set[tuple[str, str]]) -> None:
+        """Zero the crash streak of every job (ref, model) not running at this crash (D-012: only consecutive crashes count)."""
         sql = "UPDATE jobs SET crash_streak=0"
         with self._conn:
-            if except_refs:
-                self._conn.execute(f"{sql} WHERE ref NOT IN ({marks})", tuple(sorted(except_refs)))
+            if except_keys:
+                marks = ",".join(["(?, ?)"] * len(except_keys))
+                args = tuple(part for key in sorted(except_keys) for part in key)
+                self._conn.execute(f"{sql} WHERE (ref, model) NOT IN (VALUES {marks})", args)
             else:
                 self._conn.execute(sql)
 
-    def rerun(self, ref: str) -> None:
+    def rerun(self, ref: str, model: str) -> None:
         """Put a job back to pending with its counters cleared."""
         with self._conn:
             cursor = self._conn.execute(
-                "UPDATE jobs SET status='pending', attempts=0, crash_streak=0 WHERE ref=?", (ref,)
+                "UPDATE jobs SET status='pending', attempts=0, crash_streak=0 WHERE ref=? AND model=?",
+                (ref, model),
             )
         if cursor.rowcount == 0:
-            raise StateError(f"no job {ref} in state")
+            raise StateError(f"no job {ref} with model {model} in state")
 
     def ack(self, run_id: str, now: datetime) -> None:
-        """Accept a run awaiting review: the run becomes done, and its job too unless the manifest entry changed since."""
+        """Accept a run awaiting review: the run becomes done, and its job (same ref and model) too unless the manifest entry changed since."""
         run = self.get_run(run_id)
         if run is None or run.status != "awaiting-review":
             state = "no such run" if run is None else f"status {run.status}"
@@ -356,8 +396,8 @@ class State:
         with self._conn:
             self._conn.execute("UPDATE runs SET status='done' WHERE run_id=?", (run_id,))
             self._conn.execute(
-                "UPDATE jobs SET status='done' WHERE ref=? AND fingerprint=?",
-                (run.ref, run.fingerprint),
+                "UPDATE jobs SET status='done' WHERE ref=? AND model=? AND fingerprint=?",
+                (run.ref, run.model, run.fingerprint),
             )
             self._event(now, "done", run.ref, f"acked {run_id}")
 

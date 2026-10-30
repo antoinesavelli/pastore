@@ -21,8 +21,9 @@ ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]*")
 DURATION = re.compile(r"([1-9][0-9]*)([smh])")
 UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600}
 TASK_KEYS = frozenset(
-    "id kind argv cwd env model models timeout ok_exit resumable ollama_env reader ready".split()
+    "id kind argv cwd env model models timeout ok_exit resumable ollama_env model_env reader ready".split()
 )
+RESERVED_ENV = frozenset({"PASTORE_RUN_DIR", "FUCONE_RUN_DIR"})
 Which = Callable[[str], str | None]
 _NO_ARGV: tuple[str, ...] = ()
 _NO_READER: RunReader | ValidateReader = RunReader(())
@@ -74,14 +75,24 @@ def _cwd(value: object, root: Path) -> Path:
     return Path(real)
 
 
-def _env(value: object, ollama_env: str) -> dict[str, str]:
+def _model_env(value: object, ollama_env: str) -> str:
+    if not isinstance(value, str) or not ENV_NAME.fullmatch(value):
+        raise ManifestError(f"model_env must match {ENV_NAME.pattern}")
+    if value == ollama_env or value in RESERVED_ENV:
+        raise ManifestError(
+            f"model_env {value!r} may not be ollama_env or any of {sorted(RESERVED_ENV)}"
+        )
+    return value
+
+
+def _env(value: object, ollama_env: str, model_env: str) -> dict[str, str]:
     if value is None:
         return {}
     if not isinstance(value, dict) or not all(
         isinstance(k, str) and isinstance(v, str) for k, v in value.items()
     ):
         raise ManifestError("env must be a mapping of string to string")
-    reserved = {"PASTORE_RUN_DIR", "FUCONE_RUN_DIR", ollama_env} & set(value)
+    reserved = (RESERVED_ENV | ({ollama_env, model_env} - {""})) & set(value)
     if reserved:
         raise ManifestError(f"env may not set {sorted(reserved)}; pastore owns them")
     return dict(value)
@@ -177,6 +188,7 @@ def _parse_task(
     if not isinstance(ollama_env, str) or not ENV_NAME.fullmatch(ollama_env):
         errors.append(f"{tid}: ollama_env must match {ENV_NAME.pattern}")
         ollama_env = ""
+    model_env = guard(lambda: _model_env(raw.get("model_env"), ollama_env), "")
     cwd = guard(lambda: _cwd(raw.get("cwd"), root), root)
     argv = guard(lambda: _argv(raw.get("argv"), "argv"), _NO_ARGV)
     if argv:
@@ -187,11 +199,12 @@ def _parse_task(
         kind=kind if isinstance(kind, str) else "",
         argv=argv,
         cwd=cwd,
-        env=guard(lambda: _env(raw.get("env"), ollama_env), {}),
+        env=guard(lambda: _env(raw.get("env"), ollama_env, model_env), {}),
         models=guard(lambda: _models(raw), ()),
         timeout_s=guard(lambda: parse_duration(raw.get("timeout")), 0),
         ok_exit=guard(lambda: _ok_exit(raw.get("ok_exit")), frozenset({0})),
         ollama_env=ollama_env,
+        model_env=model_env,
         reader=guard(lambda: _reader(raw.get("reader"), cwd, root, which), _NO_READER),
         ready=guard(lambda: _ready(raw.get("ready"), cwd, root, which), None),
         root=root,

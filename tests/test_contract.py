@@ -38,6 +38,7 @@ def make_spec(tmp_path: Path) -> TaskSpec:
         timeout_s=3,
         ok_exit=frozenset({0}),
         ollama_env="MY_OLLAMA",
+        model_env="PASTORE_MODEL",
         reader=RunReader(argv=("true",)),
         ready=None,
         root=tmp_path,

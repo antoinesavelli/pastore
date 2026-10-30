@@ -1,6 +1,6 @@
 """The dispatcher: each tick heartbeats, honours stop and run-now requests, watches the running job, or starts the next.
 
-Depends on: policy (PolicyCache), manifest, state (State, rows, lock), window, checks (Host), runner, contract (Started), spec.
+Depends on: policy (PolicyCache), manifest, state (State, rows, lock), checks (Host), runner, contract (Started), spec.
 """
 
 import math
@@ -9,7 +9,7 @@ import sys
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import closing
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime, timedelta, tzinfo
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from subprocess import CompletedProcess
 from types import FrameType
@@ -19,9 +19,8 @@ from pastore.contract import Started
 from pastore.manifest import ManifestError
 from pastore.policy import Policy, PolicyCache
 from pastore.runner import BASE_ENV_KEYS, RunDir, fresh_run_dir, stop_leftovers
-from pastore.spec import RunReader, TaskSpec, idle_reason
+from pastore.spec import WORKSTATION, RunReader, TaskSpec, idle_reason
 from pastore.state import DispatcherLock, JobRow, RunRow, State, StatePaths, open_state
-from pastore.window import in_window
 
 MAX_ATTEMPTS = 3
 STARVED_AFTER = timedelta(hours=24)
@@ -30,6 +29,7 @@ TICK_S = 30.0
 RunIn = Callable[[Sequence[str], Path, Mapping[str, str]], CompletedProcess[str]]
 LoadManifest = Callable[[Path, str], dict[str, TaskSpec]]
 StartRun = Callable[[TaskSpec, RunDir, str, str, Mapping[str, str]], Started]
+Unit = tuple[TaskSpec, str]
 
 
 @dataclass(frozen=True)
@@ -43,7 +43,6 @@ class Deps:
     start: StartRun
     base_env: Mapping[str, str]
     ollama_url: str
-    local_tz: tzinfo | None
 
 
 @dataclass(frozen=True)
@@ -51,6 +50,7 @@ class Active:
     """The one running job."""
 
     spec: TaskSpec
+    model: str
     run_id: str
     run_dir: RunDir
     started_at: datetime
@@ -77,18 +77,19 @@ class Dispatcher:
     def recover(self, now: datetime) -> None:
         """Stop leftover scopes, return running rows to pending, charge only a second consecutive crash."""
         stop_leftovers(self.deps.host.run)
-        crashed = set()
+        crashed: set[tuple[str, str]] = set()
         for run in self.state.runs_with_status("running"):
-            crashed.add(run.ref)
+            crashed.add((run.ref, run.model))
             self.state.update_run(replace(run, status="crashed", ended_at=iso(now)))
-            job = self.state.get_job(run.ref)
+            job = self.state.get_job(run.ref, run.model)
             if job is not None:
                 self.state.upsert_job(_charge_crash(job))
         for job in self.state.jobs_with_status("running"):
-            if job.ref not in crashed:
+            if (job.ref, job.model) not in crashed:
                 self.state.upsert_job(replace(job, status="pending"))
         self.state.reset_crash_streaks(crashed)
-        self.state.record_event(now, "recover", detail=",".join(sorted(crashed)))
+        detail = ",".join(f"{ref} {model}" for ref, model in sorted(crashed))
+        self.state.record_event(now, "recover", detail=detail)
 
     def tick(self, now: datetime) -> bool:
         """Run one decision step; False means the dispatcher should exit."""
@@ -121,7 +122,7 @@ class Dispatcher:
         active, self.active = self.active, None
         code = active.handle.stop(self.deps.host.run)
         self._end_run(active, now, "stopped", code)
-        self.state.upsert_job(replace(self._job(active.spec), status="pending"))
+        self.state.upsert_job(replace(self._job(active.spec, active.model), status="pending"))
 
     def _watch(self, now: datetime) -> None:
         assert self.active is not None
@@ -137,7 +138,7 @@ class Dispatcher:
 
     def _finish(self, active: Active, now: datetime, code: int, timed_out: bool) -> None:
         spec = active.spec
-        job = replace(self._job(spec), crash_streak=0)
+        job = replace(self._job(spec, active.model), crash_streak=0)
         if not timed_out and code in spec.ok_exit:
             self._read(active, now, job, code)
             return
@@ -146,7 +147,7 @@ class Dispatcher:
         status = "failed" if attempts >= MAX_ATTEMPTS else "pending"
         self.state.upsert_job(replace(job, attempts=attempts, status=status))
         if status == "failed":
-            self.state.record_event(now, "failed", spec.ref, f"{attempts} attempts")
+            self.state.record_event(now, "failed", spec.ref, f"{active.model}: {attempts} attempts")
 
     def _read(self, active: Active, now: datetime, job: JobRow, code: int) -> None:
         spec = active.spec
@@ -158,7 +159,7 @@ class Dispatcher:
             status = "reader-failed" if reader_rc != 0 else "awaiting-review"
             self._end_run(active, now, status, code)
             self.state.upsert_job(replace(job, attempts=0, status="blocked"))
-            detail = f"reader exit {reader_rc}" if reader_rc != 0 else active.run_id
+            detail = f"{active.model}: reader exit {reader_rc}" if reader_rc != 0 else active.run_id
             self.state.record_event(now, status, spec.ref, detail)
             return
         self._end_run(active, now, "done", code)
@@ -185,77 +186,81 @@ class Dispatcher:
         return {**base, **spec.env}
 
     def _dispatch(self, now: datetime, policy: Policy) -> None:
-        specs = self._listed_specs(now, policy)
-        forced = self._run_now(now, specs)
-        ready = [forced] if forced else [s for s in specs if self._is_ready(now, s)]
-        reason = self._idle_reason(now, policy, ready, forced is not None)
+        units = self._listed(now, policy)
+        forced = self._run_now(now, units)
+        ready = [forced] if forced else [u for u in units if self._is_ready(now, *u)]
+        reason = self._idle_reason(ready)
         if reason is not None:
             if forced is not None:
-                self.state.record_event(now, "refused", forced.ref, f"run-now: {reason}")
+                detail = f"{forced[1]}: run-now: {reason}"
+                self.state.record_event(now, "refused", forced[0].ref, detail)
             self.state.set_idle_reason(now, reason)
             return
         self.state.clear_idle_reason()
-        self._start(now, ready[0])
+        self._start(now, *ready[0])
 
-    def _run_now(self, now: datetime, specs: list[TaskSpec]) -> TaskSpec | None:
-        ref = self.state.run_now_requested()
-        if ref is None:
+    def _run_now(self, now: datetime, units: list[Unit]) -> Unit | None:
+        key = self.state.run_now_requested()
+        if key is None:
             return None
         self.state.clear_run_now()
-        match = [s for s in specs if s.ref == ref and self._job(s).status == "pending"]
+        match = [u for u in units if (u[0].ref, u[1]) == key and self._job(*u).status == "pending"]
         if not match:
-            detail = "run-now: not listed, no contract pass, or not pending (use rerun first)"
-            self.state.record_event(now, "refused", ref, detail)
+            detail = (
+                f"{key[1]}: run-now: not listed, no contract pass, or not pending (use rerun first)"
+            )
+            self.state.record_event(now, "refused", key[0], detail)
         return match[0] if match else None
 
-    def _idle_reason(
-        self, now: datetime, policy: Policy, ready: list[TaskSpec], forced: bool
-    ) -> str | None:
+    def _idle_reason(self, ready: list[Unit]) -> str | None:
         if stopped(self.deps.paths.stop_file):
             return idle_reason("stopped")
-        local = now.astimezone(self.deps.local_tz)
-        if not forced and not in_window(local, policy.window_start, policy.window_end):
-            return idle_reason("outside-window")
         if not ready:
             return idle_reason("no-ready-task")
         return host_idle_reason(self.deps.host, self.deps.ollama_url)
 
-    def _listed_specs(self, now: datetime, policy: Policy) -> list[TaskSpec]:
-        specs = []
+    def _listed(self, now: datetime, policy: Policy) -> list[Unit]:
+        units = []
         manifests: dict[str, dict[str, TaskSpec]] = {}
-        for ref in policy.jobs:
-            consumer, task_id = ref.split("/", 1)
+        for pair in policy.jobs:
+            consumer, task_id = pair.task.split("/", 1)
             try:
                 if consumer not in manifests:
                     path = policy.consumers[consumer]
                     manifests[consumer] = self.deps.load_manifest(path, consumer)
                 spec = manifests[consumer][task_id]
             except (ManifestError, OSError, KeyError) as exc:
-                self._refuse(now, ref, f"manifest: {exc}")
+                self._refuse(now, pair.task, f"manifest: {exc}")
                 continue
-            if not self.state.has_contract_pass(ref, spec.fingerprint):
-                self._refuse(now, ref, f"no contract pass for fingerprint {spec.fingerprint[:12]}")
+            if pair.model not in spec.models:
+                self._refuse(
+                    now, pair.task, f"model {pair.model!r} is not in the manifest's models"
+                )
                 continue
-            specs.append(spec)
-        return specs
+            if not self.state.has_contract_pass(pair.task, spec.fingerprint):
+                detail = f"no contract pass for fingerprint {spec.fingerprint[:12]}"
+                self._refuse(now, pair.task, detail)
+                continue
+            units.append((spec, pair.model))
+        return units
 
     def _refuse(self, now: datetime, ref: str, detail: str) -> None:
         if (ref, detail) not in self._refused:
             self._refused.add((ref, detail))
             self.state.record_event(now, "refused", ref, detail)
 
-    def _job(self, spec: TaskSpec) -> JobRow:
-        job = self.state.get_job(spec.ref)
+    def _job(self, spec: TaskSpec, model: str) -> JobRow:
+        job = self.state.get_job(spec.ref, model)
         if job is None or job.fingerprint != spec.fingerprint:
-            job = JobRow(spec.ref, spec.fingerprint, "pending")
+            job = JobRow(spec.ref, model, spec.fingerprint, "pending")
             self.state.upsert_job(job)
         if spec.ready is not None and job.status == "done":
             job = replace(job, status="pending", ready_since=None)
             self.state.upsert_job(job)
         return job
 
-    def _is_ready(self, now: datetime, spec: TaskSpec) -> bool:
-        job = self._job(spec)
+    def _is_ready(self, now: datetime, spec: TaskSpec, model: str) -> bool:
+        job = self._job(spec, model)
         if job.status != "pending":
             return False
         if job.ready_since is None:
@@ -288,22 +293,24 @@ class Dispatcher:
             return
         if now - datetime.fromisoformat(job.ready_since) > STARVED_AFTER:
             self.state.upsert_job(replace(job, starved_flagged=1))
-            self.state.record_event(now, "starved", job.ref, f"ready since {job.ready_since}")
+            detail = f"{job.model}: ready since {job.ready_since}"
+            self.state.record_event(now, "starved", job.ref, detail)
 
-    def _start(self, now: datetime, spec: TaskSpec) -> None:
+    def _start(self, now: datetime, spec: TaskSpec, model: str) -> None:
         run_id, run_dir = fresh_run_dir(self.deps.paths.runs_dir, now)
-        self.state.insert_run(RunRow(run_id, spec.ref, spec.fingerprint, "running", iso(now)))
-        self.state.upsert_job(replace(self._job(spec), status="running"))
-        self.state.record_event(now, "run-start", spec.ref, run_id)
+        run = RunRow(run_id, spec.ref, model, WORKSTATION, spec.fingerprint, "running", iso(now))
+        self.state.insert_run(run)
+        self.state.upsert_job(replace(self._job(spec, model), status="running"))
+        self.state.record_event(now, "run-start", spec.ref, f"{run_id} {model}")
         try:
             handle = self.deps.start(
                 spec, run_dir, run_id, self.deps.ollama_url, self.deps.base_env
             )
         except OSError as exc:
-            self._finish(Active(spec, run_id, run_dir, now, _NoHandle()), now, 127, False)
-            self.state.record_event(now, "refused", spec.ref, f"could not start: {exc}")
+            self._finish(Active(spec, model, run_id, run_dir, now, _NoHandle()), now, 127, False)
+            self.state.record_event(now, "refused", spec.ref, f"{model}: could not start: {exc}")
             return
-        self.active = Active(spec, run_id, run_dir, now, handle)
+        self.active = Active(spec, model, run_id, run_dir, now, handle)
 
 
 class _NoHandle:

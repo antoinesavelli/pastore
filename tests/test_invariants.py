@@ -97,6 +97,7 @@ def test_invariant_no_real_clock_in_decision_code() -> None:
 def test_invariant_idle_reasons_are_a_closed_list() -> None:
     """Anything outside the closed list, or gpu-foreign without its process, is refused."""
     assert idle_reason("gpu-foreign", "/opt/x") == "gpu-foreign:/opt/x"
-    for bad in (("busy", ""), ("gpu-foreign", ""), ("stopped", "why")):
+    assert idle_reason("no-fit") == "no-fit" and idle_reason("executor-down") == "executor-down"
+    for bad in (("busy", ""), ("gpu-foreign", ""), ("stopped", "why"), ("outside-window", "")):
         with pytest.raises(ValueError):
             idle_reason(*bad)

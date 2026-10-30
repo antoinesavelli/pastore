@@ -1,22 +1,78 @@
-"""Shared value types: a validated task, its reader and ready rule, and the closed idle-reason and event lists.
+"""Shared value types: tasks, hosts, source levels and rules, listed pairs, and the closed idle-reason and event lists.
 
-Depends on: nothing in pastore; manifest.py builds these, every other module only reads them.
+Depends on: nothing in pastore; manifest.py and policy.py build these, every other module only reads them.
 """
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import IntEnum
 from pathlib import Path
 
 IDLE_REASONS = (
-    "outside-window",
     "no-ready-task",
+    "no-fit",
     "driver-mismatch",
     "ollama-down",
+    "executor-down",
     "gpu-foreign",
     "low-memory",
     "stopped",
 )
 TASK_EVENTS = ("refused", "reader-failed", "awaiting-review", "starved", "done", "failed")
+WORKSTATION = "workstation"
+SOURCE_KINDS = ("cgroup", "peer", "ancestor", "under")
+EXCLUDABLE_KINDS = ("cgroup", "peer")
+
+
+class Level(IntEnum):
+    """Request priority by source (D-026, R21): a lower value is served first; `policy.yaml` names it in lowercase."""
+
+    REINS = 1
+    WEBUI = 2
+    CODING = 3
+    CORSU = 4
+    ROUTINE = 5
+    HEARTH = 6
+
+
+UNKNOWN_LEVEL = Level.ROUTINE
+
+
+@dataclass(frozen=True)
+class Host:
+    """One machine from `policy.yaml` `hosts:` (R23, R25): its Ollama URL, VRAM, model cap and per-model parallelism."""
+
+    name: str
+    url: str
+    vram_gb: int
+    max_models: int
+    parallel: int
+
+
+@dataclass(frozen=True)
+class SourceRule:
+    """One `policy.yaml` `sources:` row (R21, R22); rules are tried in order and the first match sets the level.
+
+    `kind` is one of SOURCE_KINDS: `cgroup` globs the leaf unit of a loopback client's cgroup; `peer` holds the CIDRs a
+    non-loopback peer address must fall in; `ancestor` holds `comm` names of the loopback client or any ancestor;
+    `under` holds absolute directories the loopback client's exe or cwd must be at or below. `exclude` (globs or CIDRs,
+    same form as `values`) is allowed only for EXCLUDABLE_KINDS. A request no rule matches gets UNKNOWN_LEVEL.
+    """
+
+    level: Level
+    kind: str
+    values: tuple[str, ...]
+    exclude: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class Pair:
+    """One listed job (R29): a task `<consumer>/<id>`, the model it runs, and the evidence file the owner approved."""
+
+    task: str
+    model: str
+    evidence: Path
+    sha256: str
 
 
 @dataclass(frozen=True)
@@ -56,6 +112,7 @@ class TaskSpec:
     timeout_s: int
     ok_exit: frozenset[int]
     ollama_env: str
+    model_env: str
     reader: RunReader | ValidateReader
     ready: Ready | None
     root: Path
