@@ -1,13 +1,13 @@
 """Quiet-hours arithmetic with fixed tz-aware datetimes.
 
-Depends on: fucone.window only.
+Depends on: pastore.window only.
 """
 
 from datetime import UTC, datetime, time, timedelta, timezone
 
 import pytest
 
-from fucone.window import in_window, next_window_start
+from pastore.window import in_window, next_window_start
 
 TZ = timezone(timedelta(hours=-4))
 NIGHT = (time(22, 0), time(6, 0))

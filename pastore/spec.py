@@ -1,6 +1,6 @@
 """Shared value types: a validated task, its reader and ready rule, and the closed idle-reason and event lists.
 
-Depends on: nothing in fucone; manifest.py builds these, every other module only reads them.
+Depends on: nothing in pastore; manifest.py builds these, every other module only reads them.
 """
 
 from collections.abc import Mapping
@@ -63,7 +63,7 @@ class TaskSpec:
 
     @property
     def ref(self) -> str:
-        """The task's name everywhere in fucone: `<consumer>/<id>`."""
+        """The task's name everywhere in pastore: `<consumer>/<id>`."""
         return f"{self.consumer}/{self.id}"
 
 

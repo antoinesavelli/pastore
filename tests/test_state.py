@@ -1,6 +1,6 @@
 """Pins the SQLite state: schema version refusal, read-only access, idle, stop and contract bookkeeping, the lock, reset.
 
-Depends on: fucone.state, tests.fakes and pytest only.
+Depends on: pastore.state, tests.fakes and pytest only.
 """
 
 import sqlite3
@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from fucone.state import (
+from pastore.state import (
     DispatcherLock,
     JobRow,
     LockHeld,
@@ -34,9 +34,9 @@ def paths(tmp_path: Path) -> StatePaths:
 
 def test_default_paths_keep_outputs_outside_the_state_dir(tmp_path: Path) -> None:
     p = default_paths(tmp_path)
-    assert p.db == tmp_path / ".local/state/fucone/state.db"
+    assert p.db == tmp_path / ".local/state/pastore/state.db"
     assert p.stop_file == p.state_dir / "STOP" and p.lock == p.state_dir / "dispatcher.lock"
-    assert p.runs_dir == tmp_path / ".local/share/fucone/runs"
+    assert p.runs_dir == tmp_path / ".local/share/pastore/runs"
     assert p.state_dir not in p.runs_dir.parents
 
 

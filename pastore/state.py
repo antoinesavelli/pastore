@@ -1,6 +1,6 @@
 """SQLite WAL state (jobs, runs, events, contracts, meta), the dispatcher flock, and reset.
 
-Depends on: fucone.spec and stdlib (sqlite3, fcntl) only; never reads a clock.
+Depends on: pastore.spec and stdlib (sqlite3, fcntl) only; never reads a clock.
 """
 
 import fcntl
@@ -12,7 +12,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, Literal, Self
 
-from fucone.spec import TASK_EVENTS, idle_reason
+from pastore.spec import TASK_EVENTS, idle_reason
 
 SCHEMA_VERSION = 1
 DISPATCHER_EVENTS = (
@@ -56,7 +56,7 @@ class LockHeld(StateError):
 
 @dataclass(frozen=True)
 class StatePaths:
-    """Where fucone keeps its state (small, resettable) and run outputs (never reset)."""
+    """Where pastore keeps its state (small, resettable) and run outputs (never reset)."""
 
     state_dir: Path
     db: Path
@@ -67,13 +67,13 @@ class StatePaths:
 
 def default_paths(home: Path) -> StatePaths:
     """The standard layout under `home` (R2)."""
-    state_dir = home / ".local" / "state" / "fucone"
+    state_dir = home / ".local" / "state" / "pastore"
     return StatePaths(
         state_dir=state_dir,
         db=state_dir / "state.db",
         lock=state_dir / "dispatcher.lock",
         stop_file=state_dir / "STOP",
-        runs_dir=home / ".local" / "share" / "fucone" / "runs",
+        runs_dir=home / ".local" / "share" / "pastore" / "runs",
     )
 
 
@@ -136,8 +136,8 @@ def _check_version(conn: sqlite3.Connection, paths: StatePaths) -> bool:
     if version != SCHEMA_VERSION:
         conn.close()
         raise StateError(
-            f"{paths.db} has schema version {version}, this fucone needs {SCHEMA_VERSION}; "
-            "refusing to start (fucone reset wipes state)"
+            f"{paths.db} has schema version {version}, this pastore needs {SCHEMA_VERSION}; "
+            "refusing to start (pastore reset wipes state)"
         )
     return False
 

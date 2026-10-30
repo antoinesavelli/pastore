@@ -1,6 +1,6 @@
 """Pins policy.yaml parsing, canonical rendering, last-good caching and the add/remove edits.
 
-Depends on: fucone.policy and pytest only.
+Depends on: pastore.policy and pytest only.
 """
 
 from datetime import time
@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from fucone.policy import (
+from pastore.policy import (
     Policy,
     PolicyCache,
     PolicyError,

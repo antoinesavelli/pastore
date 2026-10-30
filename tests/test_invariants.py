@@ -1,6 +1,6 @@
-"""Repo-wide invariant scans over fucone's own source: never sudo, and no real clock outside the CLI.
+"""Repo-wide invariant scans over pastore's own source: never sudo, and no real clock outside the CLI.
 
-Depends on: the source files under fucone/ (scanned as AST), plus fucone.spec.idle_reason.
+Depends on: the source files under pastore/ (scanned as AST), plus pastore.spec.idle_reason.
 """
 
 import ast
@@ -8,9 +8,9 @@ from pathlib import Path
 
 import pytest
 
-from fucone.spec import idle_reason
+from pastore.spec import idle_reason
 
-PACKAGE = Path(__file__).resolve().parent.parent / "fucone"
+PACKAGE = Path(__file__).resolve().parent.parent / "pastore"
 CLOCK_CALLS = {
     ("time", "time"),
     ("time", "monotonic"),
@@ -24,7 +24,7 @@ CLOCK_ALLOWED = {"cli.py"}
 
 def _sources() -> list[Path]:
     files = sorted(PACKAGE.glob("*.py"))
-    assert files, "no fucone sources found"
+    assert files, "no pastore sources found"
     return files
 
 
@@ -78,7 +78,7 @@ def test_scanners_catch_violations() -> None:
 
 
 def test_invariant_never_sudo() -> None:
-    """No fucone source builds a sudo/pkexec or system-manager systemd command."""
+    """No pastore source builds a sudo/pkexec or system-manager systemd command."""
     found = [v for p in _sources() for v in sudo_violations(p.name, p.read_text())]
     assert found == []
 

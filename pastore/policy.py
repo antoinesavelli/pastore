@@ -20,7 +20,7 @@ HHMM = re.compile(r"([01]\d|2[0-3]):[0-5]\d")
 HEADER = (
     "# The single human gate: only jobs listed under `jobs` ever run, in this order"
     " (first = highest priority).\n"
-    "# Adding a job is ask-first and needs a passing `fucone check --contract <consumer>/<id>`"
+    "# Adding a job is ask-first and needs a passing `pastore check --contract <consumer>/<id>`"
     " (docs/DESIGN.md R7).\n"
 )
 

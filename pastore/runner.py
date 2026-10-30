@@ -1,6 +1,6 @@
 """Run directories, the `systemd-run --user` scope, the job environment, stop, and leftover-scope recovery.
 
-Depends on: fucone.spec (TaskSpec); every systemctl call goes through an injected `run` callable.
+Depends on: pastore.spec (TaskSpec); every systemctl call goes through an injected `run` callable.
 """
 
 import re
@@ -11,10 +11,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
-from fucone.spec import TaskSpec
+from pastore.spec import TaskSpec
 
 BASE_ENV_KEYS = ("PATH", "HOME", "LANG", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
-_SCOPE_NAME = re.compile(r"^fucone-.+\.scope$")
+_SCOPE_NAME = re.compile(r"^pastore-.+\.scope$")
 Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 
 
@@ -28,7 +28,7 @@ class PopenLike(Protocol):
 
 @dataclass(frozen=True)
 class RunDir:
-    """One run's directory: `out` is FUCONE_RUN_DIR; the logs sit beside it."""
+    """One run's directory: `out` is PASTORE_RUN_DIR; the logs sit beside it."""
 
     root: Path
     out: Path
@@ -64,23 +64,24 @@ def make_run_dir(runs_dir: Path, run_id: str) -> RunDir:
 def job_env(
     spec: TaskSpec, run_dir: RunDir, ollama_url: str, base: Mapping[str, str]
 ) -> dict[str, str]:
-    """The explicit job environment: base keys, manifest env, FUCONE_RUN_DIR, the Ollama URL."""
+    """The explicit job environment: base keys, manifest env, the run dir, the Ollama URL."""
     env = {key: base[key] for key in BASE_ENV_KEYS if key in base}
     env.update(spec.env)
-    env["FUCONE_RUN_DIR"] = str(run_dir.out)
+    # FUCONE_RUN_DIR: compatibility until consumers read PASTORE_RUN_DIR (R31)
+    env["PASTORE_RUN_DIR"] = env["FUCONE_RUN_DIR"] = str(run_dir.out)
     env[spec.ollama_env] = ollama_url
     return env
 
 
 def scope_argv(run_id: str, argv: Sequence[str], timeout_s: int) -> list[str]:
-    """Wrap argv in a transient user scope inside heavy-jobs.slice; systemd kills it at timeout_s even if fucone dies."""
+    """Wrap argv in a transient user scope inside heavy-jobs.slice; systemd kills it at timeout_s even if pastore dies."""
     return [
         "systemd-run",
         "--user",
         "--scope",
         "--quiet",
         "--slice=heavy-jobs.slice",
-        f"--unit=fucone-{run_id}",
+        f"--unit=pastore-{run_id}",
         "-p",
         "CPUWeight=20",
         "-p",
@@ -103,7 +104,7 @@ class RunHandle:
 
     def stop(self, run: Runner, wait_s: float = 30.0) -> int:
         """Stop the scope, wait for the process, kill it if it outlives `wait_s`."""
-        run(["systemctl", "--user", "stop", f"fucone-{self.run_id}.scope"])
+        run(["systemctl", "--user", "stop", f"pastore-{self.run_id}.scope"])
         try:
             return self.proc.wait(wait_s)
         except subprocess.TimeoutExpired:
@@ -136,10 +137,10 @@ def start_run(
 
 
 def leftover_scopes(run: Runner) -> list[str]:
-    """Names of fucone-*.scope units systemd still knows about."""
+    """Names of pastore-*.scope units systemd still knows about."""
     result = run(
         ["systemctl", "--user", "list-units", "--type=scope", "--all", "--plain", "--no-legend"]
-        + ["fucone-*"]
+        + ["pastore-*"]
     )
     if result.returncode != 0:
         raise RuntimeError(f"systemctl list-units exited {result.returncode}: {result.stderr}")
@@ -148,7 +149,7 @@ def leftover_scopes(run: Runner) -> list[str]:
 
 
 def stop_leftovers(run: Runner) -> list[str]:
-    """Stop every leftover fucone scope by name and return the names."""
+    """Stop every leftover pastore scope by name and return the names."""
     names = leftover_scopes(run)
     for name in names:
         result = run(["systemctl", "--user", "stop", name])

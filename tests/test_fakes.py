@@ -1,6 +1,6 @@
 """Tests that pin the shared test doubles, so a broken fake cannot make a real test pass.
 
-Depends on: fucone/fake_ollama.py, tests/fakes.py.
+Depends on: pastore/fake_ollama.py, tests/fakes.py.
 """
 
 import urllib.error
@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from fucone.fake_ollama import FakeOllama, refused_url
+from pastore.fake_ollama import FakeOllama, refused_url
 from tests.fakes import FakeClock, RecordingRunner
 
 

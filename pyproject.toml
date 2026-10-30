@@ -1,12 +1,12 @@
 [project]
-name = "fucone"
+name = "pastore"
 version = "0.0.0"
 description = "Night-shift GPU job queue for the workstation."
 requires-python = ">=3.12"
 dependencies = ["PyYAML==6.0.3"]
 
 [project.scripts]
-fucone = "fucone.cli:main"
+pastore = "pastore.cli:main"
 
 [dependency-groups]
 dev = [
@@ -38,4 +38,4 @@ max-complexity = 14
 [tool.mypy]
 python_version = "3.12"
 strict = true
-files = ["fucone"]
+files = ["pastore"]

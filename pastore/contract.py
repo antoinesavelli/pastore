@@ -1,6 +1,6 @@
 """Three-scenario contract harness: a job must fail loud, leaving no result, when Ollama is 503, refused or hung.
 
-Depends on: fucone.spec, fucone.runner, fucone.checks (run_argv), fucone.fake_ollama; records nothing in state.
+Depends on: pastore.spec, pastore.runner, pastore.checks (run_argv), pastore.fake_ollama; records nothing in state.
 """
 
 from collections.abc import Callable, Mapping
@@ -10,10 +10,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Protocol
 
-from fucone.checks import run_argv
-from fucone.fake_ollama import FakeOllama, Mode, refused_url
-from fucone.runner import Runner, fresh_run_dir, has_result, start_run
-from fucone.spec import TaskSpec
+from pastore.checks import run_argv
+from pastore.fake_ollama import FakeOllama, Mode, refused_url
+from pastore.runner import Runner, fresh_run_dir, has_result, start_run
+from pastore.spec import TaskSpec
 
 
 class Started(Protocol):

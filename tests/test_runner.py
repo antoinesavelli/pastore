@@ -1,6 +1,6 @@
 """Run directories, job environment, scope argv, stop and leftover-scope recovery with doubles; no systemd.
 
-Depends on: fucone.runner, fucone.spec, tests.fakes (RecordingRunner).
+Depends on: pastore.runner, pastore.spec, tests.fakes (RecordingRunner).
 """
 
 import subprocess
@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from fucone.runner import (
+from pastore.runner import (
     RunHandle,
     has_result,
     job_env,
@@ -21,7 +21,7 @@ from fucone.runner import (
     start_run,
     stop_leftovers,
 )
-from fucone.spec import RunReader, TaskSpec
+from pastore.spec import RunReader, TaskSpec
 from tests.fakes import RecordingRunner
 
 REPO = Path(__file__).resolve().parents[1]
@@ -63,6 +63,7 @@ def test_invariant_job_env_has_run_dir_and_no_leaked_vars(tmp_path: Path) -> Non
         "LANG": "C.UTF-8",
         "XDG_RUNTIME_DIR": "/run/user/1000",
         "MODE": "x",
+        "PASTORE_RUN_DIR": str(run_dir.out),
         "FUCONE_RUN_DIR": str(run_dir.out),
         "OLLAMA_HOST": "http://127.0.0.1:1",
     }
@@ -92,7 +93,7 @@ def test_scope_argv_is_user_scope_in_heavy_jobs_slice() -> None:
         "--scope",
         "--quiet",
         "--slice=heavy-jobs.slice",
-        "--unit=fucone-r1",
+        "--unit=pastore-r1",
         "-p",
         "CPUWeight=20",
         "-p",
@@ -125,7 +126,7 @@ def test_stop_stops_the_scope_then_waits_and_kills_only_on_timeout() -> None:
     run = RecordingRunner()
     clean = FakeProc()
     assert RunHandle(clean, "r1").stop(run) == 0 and not clean.killed
-    assert run.calls == [["systemctl", "--user", "stop", "fucone-r1.scope"]]
+    assert run.calls == [["systemctl", "--user", "stop", "pastore-r1.scope"]]
 
     stuck = FakeProc(hangs=True)
     assert RunHandle(stuck, "r2").stop(run, wait_s=0.01) == -9 and stuck.killed
@@ -153,15 +154,15 @@ def test_start_run_passes_wrapped_argv_explicit_env_and_new_session(tmp_path: Pa
     assert seen["stdout"].closed and seen["stderr"].closed
 
 
-def test_leftover_scopes_keeps_only_fucone_scope_names_and_stop_leftovers_stops_them() -> None:
+def test_leftover_scopes_keeps_only_pastore_scope_names_and_stop_leftovers_stops_them() -> None:
     listing = (
-        "fucone-20261024T010000-3.scope loaded active running /bin/x\n"
+        "pastore-20261024T010000-3.scope loaded active running /bin/x\n"
         "\n"
-        "fucone-foo.service loaded active running not a scope\n"
+        "pastore-foo.service loaded active running not a scope\n"
         "other.scope loaded active running no\n"
     )
     run = RecordingRunner({"systemctl": RecordingRunner.ok(listing)})
-    assert stop_leftovers(run) == ["fucone-20261024T010000-3.scope"]
+    assert stop_leftovers(run) == ["pastore-20261024T010000-3.scope"]
     assert run.calls[0] == [
         "systemctl",
         "--user",
@@ -170,9 +171,9 @@ def test_leftover_scopes_keeps_only_fucone_scope_names_and_stop_leftovers_stops_
         "--all",
         "--plain",
         "--no-legend",
-        "fucone-*",
+        "pastore-*",
     ]
-    assert run.calls[1] == ["systemctl", "--user", "stop", "fucone-20261024T010000-3.scope"]
+    assert run.calls[1] == ["systemctl", "--user", "stop", "pastore-20261024T010000-3.scope"]
 
 
 def test_leftover_scopes_fails_loud_when_systemctl_fails() -> None:

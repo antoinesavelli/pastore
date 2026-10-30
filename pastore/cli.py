@@ -1,4 +1,4 @@
-"""The fucone command line: start, stop, status, add/remove (gated), check [--contract], run-now, rerun, ack, reset.
+"""The pastore command line: start, stop, status, add/remove (gated), check [--contract], run-now, rerun, ack, reset.
 
 Depends on: policy, manifest, state, dispatcher (serve), contract, checks/runner real bindings; binds the real clock only here.
 """
@@ -18,11 +18,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal, TextIO
 
-from fucone.checks import OLLAMA_URL, real_host
-from fucone.contract import run_contract
-from fucone.dispatcher import Deps, serve
-from fucone.manifest import ManifestError, load_manifest
-from fucone.policy import (
+from pastore.checks import OLLAMA_URL, real_host
+from pastore.contract import run_contract
+from pastore.dispatcher import Deps, serve
+from pastore.manifest import ManifestError, load_manifest
+from pastore.policy import (
     Policy,
     PolicyError,
     load_policy,
@@ -31,9 +31,9 @@ from fucone.policy import (
     with_job_added,
     with_job_removed,
 )
-from fucone.runner import start_run
-from fucone.spec import TaskSpec
-from fucone.state import (
+from pastore.runner import start_run
+from pastore.spec import TaskSpec
+from pastore.state import (
     DispatcherLock,
     LockHeld,
     StateError,
@@ -43,7 +43,7 @@ from fucone.state import (
     open_state,
     reset,
 )
-from fucone.window import next_window_start
+from pastore.window import next_window_start
 
 HEARTBEAT_STALE = timedelta(seconds=60)
 SUBPROCESS_TIMEOUT_S = 45
@@ -71,7 +71,7 @@ def _refuse(text: str) -> int:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="fucone", description="Night-shift GPU job queue.")
+    parser = argparse.ArgumentParser(prog="pastore", description="Night-shift GPU job queue.")
     parser.add_argument("--policy", type=Path, help="policy.yaml to use (default: the repo's)")
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("start")
@@ -186,7 +186,7 @@ def _add(ctx: Ctx, args: argparse.Namespace) -> int:
     if not _has_contract_pass(ctx, args.ref, _spec_for(policy, args.ref).fingerprint):
         return _refuse(
             f"{args.ref}: no passing contract test for its current manifest entry; "
-            f"run: fucone check --contract {args.ref}"
+            f"run: pastore check --contract {args.ref}"
         )
     return _confirm_and_write(ctx, new, args.yes)
 
@@ -301,11 +301,11 @@ def _run_now(ctx: Ctx, args: argparse.Namespace) -> int:
     if not _has_contract_pass(ctx, args.ref, _spec_for(policy, args.ref).fingerprint):
         return _refuse(f"{args.ref}: no contract pass for its current manifest entry")
     if not _dispatcher_up(ctx):
-        return _refuse("dispatcher-down: start it first (fucone start)")
+        return _refuse("dispatcher-down: start it first (pastore start)")
     with closing(open_state(ctx.paths)) as state:
         job = state.get_job(args.ref)
         if job is not None and job.status != "pending":
-            return _refuse(f"{args.ref}: is {job.status}; run `fucone rerun {args.ref}` first")
+            return _refuse(f"{args.ref}: is {job.status}; run `pastore rerun {args.ref}` first")
         state.request_run_now(args.ref)
     _say(ctx, f"run-now queued for {args.ref}; the dispatcher picks it up within one tick")
     return 0

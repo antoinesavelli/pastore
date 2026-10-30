@@ -1,6 +1,6 @@
 """Dispatcher tests: listing gate, closed idle reasons, driver refusal, attempts, crashes, readers, stop, starved.
 
-Depends on: fucone.dispatcher with a fake Host, fake handles and a FakeClock; one end-to-end run uses real start_run.
+Depends on: pastore.dispatcher with a fake Host, fake handles and a FakeClock; one end-to-end run uses real start_run.
 """
 
 import os
@@ -15,12 +15,12 @@ from subprocess import CompletedProcess
 
 import pytest
 
-from fucone.checks import MODULE_VERSION_FILE, Host
-from fucone.dispatcher import Deps, Dispatcher, _guarded_tick, serve
-from fucone.policy import PolicyCache, PolicyError
-from fucone.runner import RunDir, start_run
-from fucone.spec import IDLE_REASONS, Ready, RunReader, TaskSpec, ValidateReader
-from fucone.state import (
+from pastore.checks import MODULE_VERSION_FILE, Host
+from pastore.dispatcher import Deps, Dispatcher, _guarded_tick, serve
+from pastore.policy import PolicyCache, PolicyError
+from pastore.runner import RunDir, start_run
+from pastore.spec import IDLE_REASONS, Ready, RunReader, TaskSpec, ValidateReader
+from pastore.state import (
     DispatcherLock,
     EventRow,
     JobRow,
@@ -344,7 +344,7 @@ def test_invariant_job_never_writes_into_a_repo(tmp_path: Path) -> None:
     script.parent.mkdir()
     script.write_text(
         "import os, pathlib\n"
-        "pathlib.Path(os.environ['FUCONE_RUN_DIR'], 'results.json').write_text('{}')\n"
+        "pathlib.Path(os.environ['PASTORE_RUN_DIR'], 'results.json').write_text('{}')\n"
     )
 
     def real_start(
@@ -409,7 +409,8 @@ def test_readers_and_checks_get_no_dispatcher_secrets(tmp_path: Path) -> None:
     rig.tick()
     check_env, reader_env = rig.run_in_envs[0], rig.run_in_envs[-1]
     assert check_env == {"PATH": "/usr/bin", "MODEL": "m"}
-    assert "SECRET_TOKEN" not in reader_env and reader_env["FUCONE_RUN_DIR"].endswith("/out")
+    assert "SECRET_TOKEN" not in reader_env and reader_env["PASTORE_RUN_DIR"].endswith("/out")
+    assert reader_env["FUCONE_RUN_DIR"] == reader_env["PASTORE_RUN_DIR"]
 
 
 def test_a_manifest_edit_reruns_a_done_one_shot(tmp_path: Path) -> None:

@@ -1,6 +1,6 @@
 """Pre-start host checks against scripted Host doubles; no real nvidia-smi, dpkg, /proc or Ollama.
 
-Depends on: fucone.checks, tests.fakes (RecordingRunner).
+Depends on: pastore.checks, tests.fakes (RecordingRunner).
 """
 
 import subprocess
@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from fucone.checks import (
+from pastore.checks import (
     GPU_ALLOWLIST,
     MEMINFO,
     MIN_AVAILABLE_BYTES,

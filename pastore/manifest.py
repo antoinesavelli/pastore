@@ -1,6 +1,6 @@
 """Parse and validate a consumer's gpu-tasks.yaml into TaskSpecs: schema, path rule (R5), per-task fingerprints.
 
-Depends on: fucone.spec, PyYAML and stdlib only.
+Depends on: pastore.spec, PyYAML and stdlib only.
 """
 
 import hashlib
@@ -13,7 +13,7 @@ from pathlib import Path
 
 import yaml
 
-from fucone.spec import Ready, RunReader, TaskSpec, ValidateReader
+from pastore.spec import Ready, RunReader, TaskSpec, ValidateReader
 
 ALLOWED_BARE = frozenset({"torra", "opencode"})
 NAME = re.compile(r"[a-z0-9][a-z0-9_-]*")
@@ -81,9 +81,9 @@ def _env(value: object, ollama_env: str) -> dict[str, str]:
         isinstance(k, str) and isinstance(v, str) for k, v in value.items()
     ):
         raise ManifestError("env must be a mapping of string to string")
-    reserved = {"FUCONE_RUN_DIR", ollama_env} & set(value)
+    reserved = {"PASTORE_RUN_DIR", "FUCONE_RUN_DIR", ollama_env} & set(value)
     if reserved:
-        raise ManifestError(f"env may not set {sorted(reserved)}; fucone owns them")
+        raise ManifestError(f"env may not set {sorted(reserved)}; pastore owns them")
     return dict(value)
 
 

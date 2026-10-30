@@ -1,14 +1,14 @@
 """Pins gpu-tasks.yaml validation: schema, the argv/cwd path rule (R5) and per-task fingerprints.
 
-Depends on: fucone.manifest, fucone.spec and pytest only.
+Depends on: pastore.manifest, pastore.spec and pytest only.
 """
 
 from pathlib import Path
 
 import pytest
 
-from fucone.manifest import ManifestError, load_manifest, parse_duration
-from fucone.spec import Ready, RunReader, ValidateReader
+from pastore.manifest import ManifestError, load_manifest, parse_duration
+from pastore.spec import Ready, RunReader, ValidateReader
 
 TASK = """  - id: bench
     kind: eval
@@ -117,6 +117,7 @@ def test_fingerprint_is_per_task_entry(tmp_path: Path) -> None:
         ("timeout: 2h", "timeout: 0", "duration"),
         ("timeout: 2h", "timeout: 2d", "duration"),
         ("kind: eval", "kind: ''", "kind"),
+        ("env: {MODE: fast}", "env: {PASTORE_RUN_DIR: /x}", "PASTORE_RUN_DIR"),
         ("env: {MODE: fast}", "env: {FUCONE_RUN_DIR: /x}", "FUCONE_RUN_DIR"),
         ("env: {MODE: fast}", "env: {OLLAMA_HOST: x}", "OLLAMA_HOST"),
         ("env: {MODE: fast}", "env: {MODE: 1}", "string to string"),

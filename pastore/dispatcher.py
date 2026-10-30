@@ -14,14 +14,14 @@ from pathlib import Path
 from subprocess import CompletedProcess
 from types import FrameType
 
-from fucone.checks import Host, host_idle_reason, stopped
-from fucone.contract import Started
-from fucone.manifest import ManifestError
-from fucone.policy import Policy, PolicyCache
-from fucone.runner import BASE_ENV_KEYS, RunDir, fresh_run_dir, stop_leftovers
-from fucone.spec import RunReader, TaskSpec, idle_reason
-from fucone.state import DispatcherLock, JobRow, RunRow, State, StatePaths, open_state
-from fucone.window import in_window
+from pastore.checks import Host, host_idle_reason, stopped
+from pastore.contract import Started
+from pastore.manifest import ManifestError
+from pastore.policy import Policy, PolicyCache
+from pastore.runner import BASE_ENV_KEYS, RunDir, fresh_run_dir, stop_leftovers
+from pastore.spec import RunReader, TaskSpec, idle_reason
+from pastore.state import DispatcherLock, JobRow, RunRow, State, StatePaths, open_state
+from pastore.window import in_window
 
 MAX_ATTEMPTS = 3
 STARVED_AFTER = timedelta(hours=24)
@@ -150,7 +150,9 @@ class Dispatcher:
 
     def _read(self, active: Active, now: datetime, job: JobRow, code: int) -> None:
         spec = active.spec
-        env = {**self._env(spec), "FUCONE_RUN_DIR": str(active.run_dir.out)}
+        out = str(active.run_dir.out)
+        # FUCONE_RUN_DIR: compatibility until consumers read PASTORE_RUN_DIR (R31)
+        env = {**self._env(spec), "PASTORE_RUN_DIR": out, "FUCONE_RUN_DIR": out}
         reader_rc = self.deps.run_in(spec.reader.argv, spec.cwd, env).returncode
         if reader_rc != 0 or not isinstance(spec.reader, RunReader):
             status = "reader-failed" if reader_rc != 0 else "awaiting-review"
@@ -329,7 +331,7 @@ def serve(
     sleep: Callable[[float], None],
     tick_s: float = TICK_S,
 ) -> int:
-    """Hold the lock, recover, and tick until a stop request; the only loop in fucone."""
+    """Hold the lock, recover, and tick until a stop request; the only loop in pastore."""
     with DispatcherLock(deps.paths.lock), closing(open_state(deps.paths)) as state:
 
         def log(message: str) -> None:

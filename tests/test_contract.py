@@ -1,6 +1,6 @@
 """End-to-end contract scenarios: real FakeOllama, real child processes running tiny job scripts, no systemd.
 
-Depends on: fucone.contract, fucone.runner, fucone.spec, tests.fakes (RecordingRunner).
+Depends on: pastore.contract, pastore.runner, pastore.spec, tests.fakes (RecordingRunner).
 """
 
 import os
@@ -12,15 +12,15 @@ from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 
-from fucone.contract import CONTRACT_TIMEOUT_CAP_S, SCENARIOS, ContractResult, run_contract
-from fucone.fake_ollama import FakeOllama, Mode
-from fucone.runner import RunHandle, start_run
-from fucone.spec import RunReader, TaskSpec
+from pastore.contract import CONTRACT_TIMEOUT_CAP_S, SCENARIOS, ContractResult, run_contract
+from pastore.fake_ollama import FakeOllama, Mode
+from pastore.runner import RunHandle, start_run
+from pastore.spec import RunReader, TaskSpec
 from tests.fakes import FakeClock, RecordingRunner
 
 PRELUDE = """
 import os, pathlib, urllib.request
-out = pathlib.Path(os.environ["FUCONE_RUN_DIR"])
+out = pathlib.Path(os.environ["PASTORE_RUN_DIR"])
 url = os.environ["MY_OLLAMA"] + "/api/generate"
 """
 CLIENT_TIMEOUT = "timeout=1"

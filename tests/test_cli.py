@@ -1,6 +1,6 @@
 """Pins the CLI surface: the add gate, remove, status, stop, check, rerun/ack/reset, run-now and contract gates, start wiring.
 
-Depends on: fucone.cli, fucone.dispatcher (Deps), fucone.policy, fucone.state, fucone.manifest, tests.fakes.
+Depends on: pastore.cli, pastore.dispatcher (Deps), pastore.policy, pastore.state, pastore.manifest, tests.fakes.
 """
 
 import io
@@ -11,12 +11,12 @@ from pathlib import Path
 
 import pytest
 
-from fucone import cli
-from fucone.cli import _run_in, main
-from fucone.dispatcher import Deps
-from fucone.manifest import load_manifest
-from fucone.policy import load_policy
-from fucone.state import DispatcherLock, JobRow, RunRow, default_paths, open_state
+from pastore import cli
+from pastore.cli import _run_in, main
+from pastore.dispatcher import Deps
+from pastore.manifest import load_manifest
+from pastore.policy import load_policy
+from pastore.state import DispatcherLock, JobRow, RunRow, default_paths, open_state
 from tests.fakes import FakeClock
 
 T0 = datetime(2026, 10, 25, 3, 0, tzinfo=UTC)

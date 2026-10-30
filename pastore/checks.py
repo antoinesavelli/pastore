@@ -1,6 +1,6 @@
 """Pre-start host checks (driver, Ollama, foreign GPU processes, memory) mapped to closed-list idle reasons.
 
-Depends on: fucone.spec (idle_reason); every host interaction goes through the injected `Host`.
+Depends on: pastore.spec (idle_reason); every host interaction goes through the injected `Host`.
 """
 
 import subprocess
@@ -10,7 +10,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from fucone.spec import idle_reason
+from pastore.spec import idle_reason
 
 DRIVER_PACKAGE = "libnvidia-compute-580"
 MODULE_VERSION_FILE = Path("/sys/module/nvidia/version")
