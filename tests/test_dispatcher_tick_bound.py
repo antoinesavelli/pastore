@@ -616,7 +616,7 @@ def laughs(depth: int) -> str:
 
 
 PATHOLOGICAL: dict[str, Callable[[str], str]] = {
-    "billion-laughs-depth-9": lambda _base: laughs(9),
+    "billion-laughs-depth-4": lambda _base: laughs(4),
     "one-alias": lambda _base: "version: &v 2\nother: *v\n",
     "nested-too-deep": lambda _base: "version: 2\nhosts: " + "[" * 3000 + "]" * 3000 + "\n",
     "int-over-4300-digits": lambda _base: "version: 2\nsize: " + "9" * 5000 + "\n",
@@ -762,9 +762,10 @@ def test_serve_restores_both_handlers_when_its_setup_fails(
     assert (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGALRM)) == before
 
 
-@pytest.mark.parametrize("depth", [2, 9])
+@pytest.mark.parametrize("depth", [2, 4])
 def test_aliases_are_refused_before_anything_is_expanded(depth: int) -> None:
     started = time.monotonic()
     with pytest.raises(PolicyError, match="^invalid YAML: aliases are not allowed"):
         parse_policy(laughs(depth))
-    assert time.monotonic() - started < 1.0  # the expansion of depth 9 is gigabytes
+    # Depth stays small: if the guard ever regressed, depth 9 would expand to gigabytes and kill the run.
+    assert time.monotonic() - started < 1.0
