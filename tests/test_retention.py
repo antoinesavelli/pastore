@@ -3,6 +3,10 @@
 Depends on: pastore.runner, pastore.state and pytest only; fixed datetimes, no real clock.
 """
 
+import os
+import sqlite3
+import time
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -72,6 +76,34 @@ def test_the_stamp_is_read_as_utc_whatever_zone_now_carries(tmp_path: Path) -> N
     assert (tmp_path / kept).is_dir()
 
 
+@pytest.fixture
+def local_zone() -> Iterator[Callable[[str], None]]:
+    """Switch the process time zone for a test and restore it, with tzset on both sides."""
+    saved = os.environ.get("TZ")
+
+    def switch(name: str) -> None:
+        os.environ["TZ"] = name
+        time.tzset()
+
+    yield switch
+    if saved is None:
+        os.environ.pop("TZ", None)
+    else:
+        os.environ["TZ"] = saved
+    time.tzset()
+
+
+@pytest.mark.parametrize("zone", ["Asia/Kolkata", "America/Los_Angeles", "UTC"])
+def test_the_stamp_is_read_as_utc_whatever_the_local_zone(
+    tmp_path: Path, local_zone: Callable[[str], None], zone: str
+) -> None:
+    local_zone(zone)
+    over = run_folder(tmp_path, NOW - timedelta(days=30, hours=1), 1)
+    kept = run_folder(tmp_path, NOW - timedelta(days=29, hours=23), 2)
+    assert prune_run_dirs(tmp_path, set(), NOW) == [over]
+    assert (tmp_path / kept).is_dir()
+
+
 def test_a_symlink_child_is_never_followed_or_removed(tmp_path: Path) -> None:
     runs = tmp_path / "runs"
     runs.mkdir()
@@ -91,6 +123,23 @@ def test_a_symlink_inside_an_old_folder_does_not_delete_its_target(tmp_path: Pat
     (runs / old / "out" / "link").symlink_to(keepsake, target_is_directory=True)
     assert prune_run_dirs(runs, set(), NOW) == [old]
     assert (keepsake / "data.txt").is_file()
+
+
+def test_rmtree_is_never_called_on_a_symlink_or_a_plain_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runs = tmp_path / "runs"
+    target = run_folder(tmp_path, NOW - timedelta(days=60))
+    runs.mkdir()
+    (runs / new_run_id(NOW - timedelta(days=60), 2)).symlink_to(
+        tmp_path / target, target_is_directory=True
+    )
+    (runs / new_run_id(NOW - timedelta(days=60), 3)).write_text("a file named like a run")
+    old = run_folder(runs, NOW - timedelta(days=60), 4)
+    called: list[str] = []
+    monkeypatch.setattr(runner_module.shutil, "rmtree", lambda path: called.append(Path(path).name))
+    assert prune_run_dirs(runs, set(), NOW) == [old]
+    assert called == [old]
 
 
 def test_plain_files_and_unparseable_names_are_left(tmp_path: Path) -> None:
@@ -138,6 +187,39 @@ def test_latest_run_ids_is_the_latest_per_pair_with_the_larger_id_breaking_ties(
     ):
         state.insert_run(r)
     assert state.latest_run_ids() == {"a2", "b1", "c2"}
+    state.close()
+
+
+def test_latest_run_ids_stays_fast_and_matches_last_run_on_many_rows_with_ties(
+    tmp_path: Path,
+) -> None:
+    paths = default_paths(tmp_path)
+    state = open_state(paths)
+    t = NOW - timedelta(days=200)
+    rows = [
+        (
+            f"r{i:05d}",
+            f"ref/{i % 40}",
+            f"m{i % 7}",
+            HOST,
+            "fp",
+            "done",
+            (t + timedelta(hours=i % 13)).isoformat(),
+            None,
+            None,
+            "",
+        )
+        for i in range(20_000)
+    ]
+    with sqlite3.connect(paths.db) as conn:
+        conn.executemany("INSERT INTO runs VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+    conn.close()
+    start = time.perf_counter()
+    got = state.latest_run_ids()
+    assert time.perf_counter() - start < 2
+    pairs = {(r[1], r[2]) for r in rows}
+    last = (state.last_run(ref, model) for ref, model in pairs)
+    assert len(pairs) == 280 and got == {r.run_id for r in last if r is not None}
     state.close()
 
 

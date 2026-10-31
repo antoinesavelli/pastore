@@ -318,8 +318,8 @@ class State:
     def latest_run_ids(self) -> set[str]:
         """The run id of the most recently started run of every task and model pair that has one."""
         rows = self._conn.execute(
-            "SELECT run_id FROM runs r WHERE run_id = (SELECT run_id FROM runs "
-            "WHERE ref=r.ref AND model=r.model ORDER BY started_at DESC, run_id DESC LIMIT 1)"
+            "SELECT run_id FROM (SELECT run_id, ROW_NUMBER() OVER (PARTITION BY ref, model "
+            "ORDER BY started_at DESC, run_id DESC) AS n FROM runs) WHERE n = 1"
         )
         return {row[0] for row in rows}
 
