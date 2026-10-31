@@ -1,0 +1,22 @@
+# Example policy: copy to policy.yaml (gitignored) and fill in your own hosts, consumers and pairs.
+# The single human gate: only the task+model pairs listed under `jobs` ever run, in this order (first = highest priority).
+# Adding a pair is ask-first: `pastore add <consumer>/<id> --model <name> --evidence <path>` with a passing
+# `pastore check --contract <consumer>/<id>` (docs/DESIGN.md R29).
+# `workstation` is the host the gateway and the dispatcher run on; any other host is a second Ollama host reached at
+# its own URL. Each host's context is its Ollama's default context length in tokens; placement counts KV cache per slot
+# at it (D-041). Each host's vram_gib is the usable VRAM its Ollama reports, in GiB (D-050).
+version: 2
+hosts:
+  workstation: {url: "http://127.0.0.1:11435", vram_gib: 20.0, max_models: 1, parallel: 1, context: 32768}
+  second: {url: "http://127.0.0.1:11436", vram_gib: 10.0, max_models: 1, parallel: 1, context: 8192}
+sources:
+  - {level: hearth, cgroup: ["pastore-*.scope"]}
+  - {level: webui, peer: ["172.17.0.0/16"]}
+  - {level: reins, peer: ["0.0.0.0/0", "::/0"], exclude: ["192.0.2.101/32"]}
+  - {level: coding, ancestor: ["claude", "opencode"]}
+  - {level: corsu, under: ["/srv/projects"]}
+  - {level: routine, cgroup: ["*.service", "*.scope"], exclude: ["session-*.scope"]}
+consumers:
+  example: "/srv/projects/example/gpu-tasks.yaml"
+jobs:
+  - {task: "example/index", model: "nomic-embed-text", evidence: "/srv/projects/example/evidence.json", sha256: "0000000000000000000000000000000000000000000000000000000000000000"}
