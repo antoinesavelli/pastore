@@ -1,7 +1,7 @@
 [project]
 name = "pastore"
 version = "0.0.0"
-description = "Manager, scheduler and watchdog for the workstation's and the executor's Ollama: a priority front door on :11434 and an owner-listed job queue."
+description = "A priority gateway and background job dispatcher for two Ollama hosts, written by directing AI coding agents: requests are served in order of source, and only owner-listed task+model pairs run, each on a host where the model fits."
 requires-python = ">=3.12"
 dependencies = ["PyYAML==6.0.3", "aiohttp==3.14.5"]
 
