@@ -608,7 +608,16 @@ def swap(old: str, new: str) -> Callable[[str], str]:
     return edit
 
 
+def laughs(depth: int) -> str:
+    """Anchors nested `depth` deep, each a list of ten aliases of the one before: expanded, 10 ** depth items."""
+    lines = ["a0: &a0 [" + ", ".join(["x"] * 10) + "]"]
+    lines += [f"a{i}: &a{i} [" + ", ".join([f"*a{i - 1}"] * 10) + "]" for i in range(1, depth)]
+    return "\n".join([*lines, f"version: *a{depth - 1}"]) + "\n"
+
+
 PATHOLOGICAL: dict[str, Callable[[str], str]] = {
+    "billion-laughs-depth-9": lambda _base: laughs(9),
+    "one-alias": lambda _base: "version: &v 2\nother: *v\n",
     "nested-too-deep": lambda _base: "version: 2\nhosts: " + "[" * 3000 + "]" * 3000 + "\n",
     "int-over-4300-digits": lambda _base: "version: 2\nsize: " + "9" * 5000 + "\n",
     "version-bool-tag": swap("version: 2", "version: !!bool foo"),
@@ -703,25 +712,39 @@ def test_an_interruption_around_a_refused_event_repeats_it_and_never_loses_it(
     assert len(rig.events("refused")) == 1
 
 
-def test_a_policy_edit_is_not_ignored_when_reading_it_was_interrupted(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+class Unforeseen(Exception):
+    """An error no caller of the parse lists."""
+
+
+@pytest.mark.parametrize("error", [MemoryError, Unforeseen])
+def test_a_parse_that_fails_unforeseen_costs_one_tick_and_a_stop_is_honoured_after_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: type[Exception]
 ) -> None:
-    rig = Rig(tmp_path, [task(tmp_path, "a"), task(tmp_path, "b")], ["c/a"])
-    cache = PolicyCache(rig.policy, lambda _message: None)
-    assert [p.task for p in cache.current().jobs] == ["c/a"]
-    rig.list_jobs(["c/a", "c/b"])
-    real, calls = policy_module.parse_policy, []
+    rig = rig_with(tmp_path, [task(tmp_path, "a")])
+    rig.next_codes = [None]
+    parsed: list[str] = []
 
-    def interrupted(text: str) -> policy_module.Policy:
-        calls.append(text)
-        if len(calls) == 1:
-            raise TickOverrun("cut")
-        return real(text)
+    def crashing(text: str) -> policy_module.Policy:
+        parsed.append(text)
+        raise error("a parse nobody foresaw")
 
-    monkeypatch.setattr(policy_module, "parse_policy", interrupted)
-    with pytest.raises(TickOverrun):
-        cache.current()
-    assert [p.task for p in cache.current().jobs] == ["c/a", "c/b"]
+    drive = Drive(rig, monkeypatch)
+
+    def on_nap(n: int) -> None:
+        if n == 1:
+            assert len(rig.handles) == 1
+            rig.policy.write_text(rig.policy.read_text() + "# edited\n")
+            monkeypatch.setattr(policy_module, "_parse", crashing)
+        elif (
+            n == 2
+        ):  # the tick that parsed the edit failed; the one after it served the last good policy
+            assert drive.overruns() == [f"{error.__name__}: a parse nobody foresaw"]
+            rig.state.request_stop("now")
+
+    drive.run(on_nap)
+    assert len(parsed) == 1 and rig.events("policy-error") == []  # not parsed again on every tick
+    assert rig.handles[0].stopped and drive.d.active == {}  # the stop was honoured
+    assert len(drive.overruns()) == 1
 
 
 def test_serve_restores_both_handlers_when_its_setup_fails(
@@ -737,3 +760,11 @@ def test_serve_restores_both_handlers_when_its_setup_fails(
     with pytest.raises(RuntimeError, match="recover failed"):
         serve(rig.deps, rig.policy, clock=rig.clock, sleep=lambda _s: None, tick_bound_s=BOUND_S)
     assert (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGALRM)) == before
+
+
+@pytest.mark.parametrize("depth", [2, 9])
+def test_aliases_are_refused_before_anything_is_expanded(depth: int) -> None:
+    started = time.monotonic()
+    with pytest.raises(PolicyError, match="^invalid YAML: aliases are not allowed"):
+        parse_policy(laughs(depth))
+    assert time.monotonic() - started < 1.0  # the expansion of depth 9 is gigabytes

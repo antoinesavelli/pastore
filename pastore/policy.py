@@ -13,6 +13,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 import yaml
+from yaml.composer import ComposerError
 from yaml.constructor import ConstructorError
 
 from pastore.spec import EXCLUDABLE_KINDS, SOURCE_KINDS, WORKSTATION, Host, Level, Pair, SourceRule
@@ -328,7 +329,13 @@ def _parse_jobs(
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
-    """SafeLoader that refuses merge keys and a mapping key written twice (PyYAML keeps the last)."""
+    """SafeLoader that refuses aliases (a few hundred bytes of nested ones expand to gigabytes), merge keys and a mapping key written twice (PyYAML keeps the last)."""
+
+    def compose_node(self, parent: yaml.Node | None, index: Any) -> yaml.Node | None:
+        event = self.peek_event()  # type: ignore[no-untyped-call]  # types-PyYAML leaves the parser untyped
+        if isinstance(event, yaml.AliasEvent):
+            raise ComposerError(None, None, "aliases are not allowed", event.start_mark)
+        return super().compose_node(parent, index)
 
     def construct_mapping(self, node: yaml.MappingNode, deep: bool = False) -> dict[Hashable, Any]:
         if any(key.tag == MERGE_TAG for key, _ in node.value):
@@ -400,12 +407,12 @@ class PolicyCache:
         except OSError as exc:
             data, error = f"unreadable: {exc}".encode(), PolicyError(f"cannot read: {exc}")
         if data != self._seen:
+            self._seen = data  # before the parse: an unforeseen failure in it must cost one tick, not every tick
             if error is None:
                 error = self._try_parse(data)
             self._error = error
             if error is not None:
                 self._log(f"policy error in {self._path}: {error}")
-            self._seen = data  # last: an interrupted read is repeated, never taken as seen
         if self._good is None:
             raise self._error or PolicyError("no policy loaded")
         return self._good

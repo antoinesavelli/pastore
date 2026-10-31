@@ -463,7 +463,8 @@ BAD_EDITS: list[tuple[tuple[str | int, ...], object, str]] = [
     (("jobs", 0, "sha256"), DELETE, "jobs[0]: missing key 'sha256'"),
     (
         ("jobs",),
-        [GOOD_DATA["jobs"][0]] * 2,
+        # Copies: one object listed twice would dump as an alias, which the loader refuses.
+        [copy.deepcopy(GOOD_DATA["jobs"][0]) for _ in range(2)],
         "jobs[1]: 'torra/bench' with model 'qwen3:8b' is listed twice",
     ),
 ]
@@ -511,9 +512,7 @@ def test_boundary_values_are_accepted() -> None:
     assert policy.sources[3].values == ("x" * 15, "\u00e9" * 7 + "a")
 
 
-@pytest.mark.parametrize(
-    "text", ["x: &a {k: 1}\ny:\n  <<: *a\n", "x: &a {k: 1}\ny:\n  <<: *a\n  k: 2\n"]
-)
+@pytest.mark.parametrize("text", ["y:\n  <<: {k: 1}\n", "y:\n  <<: {k: 1}\n  k: 2\n"])
 def test_merge_keys_are_refused_plainly(text: str) -> None:
     with pytest.raises(PolicyError) as info:
         parse_policy(text)
