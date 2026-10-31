@@ -12,7 +12,7 @@ import pytest
 from aiohttp import web
 
 from pastore.gateway import __main__ as entry
-from pastore.policy import Policy, load_policy
+from pastore.policy import Policy, PolicyError, load_policy, parse_policy
 
 ROOT = Path(__file__).resolve().parent.parent
 REPO_POLICY = ROOT / "policy.yaml"
@@ -178,10 +178,10 @@ def test_a_bad_policy_without_a_copy_exits_2(
     """With nothing to fall back to, a bad policy exits 2 as before and nothing is served."""
     policy = tmp_path / "policy.yaml"
     policy.write_text("version: 1\n")
-    copy_of(home)
+    copy = copy_of(home)
     assert start(policy) == 2
     err = capsys.readouterr().err
-    assert "version must be 2" in err and "last good copy: cannot read" in err
+    assert "version must be 2" in err and f"last good copy {copy}: cannot read" in err
     assert served == []
 
 
@@ -195,7 +195,8 @@ def test_a_bad_policy_with_a_bad_copy_exits_2_naming_both(
     copy.write_text("jobs: []\n")
     assert start(policy) == 2
     err = capsys.readouterr().err
-    assert "version must be 2" in err and "last good copy: " in err and "missing key" in err
+    assert err.count("\n") == 1
+    assert "version must be 2" in err and f"last good copy {copy}: " in err and "missing key" in err
     assert served == []
     assert copy.read_text() == "jobs: []\n"
 
@@ -237,4 +238,77 @@ def test_a_failing_write_warns_and_still_starts(
     assert err.startswith(f"{WARNING}could not keep the last good policy copy {copy}: ")
     assert err.count("\n") == 1 and "denied" in err
     assert copy.read_text() == OTHER
+    assert [p.name for p in copy.parent.iterdir()] == [copy.name]
     assert served[0].hosts["workstation"].context == 32768
+
+
+def test_a_multi_line_load_error_is_one_warning_line(
+    tmp_path: Path, home: Path, served: list[Policy], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A YAML syntax error spans several lines; the fallback warning must still be one `<4>` line naming the copy."""
+    policy = tmp_path / "policy.yaml"
+    policy.write_text("version: 2\nhosts: [\n")
+    with pytest.raises(PolicyError) as info:
+        parse_policy(policy.read_text())
+    assert "\n" in str(info.value)
+    copy = copy_of(home)
+    copy.write_text(OTHER)
+    assert start(policy) == 0
+    err = capsys.readouterr().err
+    assert err.startswith(WARNING) and err.count("\n") == 1
+    assert f"started on the last good copy {copy}" in err
+
+
+def test_a_multi_line_load_error_is_one_line_when_exiting_2(
+    tmp_path: Path, home: Path, served: list[Policy], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With no copy to fall back to, a multi-line error is still one stderr line."""
+    policy = tmp_path / "policy.yaml"
+    policy.write_text("version: 2\nhosts: [\n")
+    copy_of(home)
+    assert start(policy) == 2
+    err = capsys.readouterr().err
+    assert err.startswith("pastore gateway: invalid YAML") and err.count("\n") == 1
+
+
+def test_a_planted_symlink_is_never_followed(
+    tmp_path: Path, home: Path, served: list[Policy]
+) -> None:
+    """A symlink named like the old fixed temp file is neither written through nor installed as the copy."""
+    policy = tmp_path / "policy.yaml"
+    policy.write_text(GOOD)
+    victim = tmp_path / "victim.txt"
+    victim.write_text("precious")
+    copy = copy_of(home)
+    for name in (copy.name + ".tmp", ".gateway-policy-.tmp"):
+        (copy.parent / name).symlink_to(victim)
+    assert start(policy) == 0
+    assert victim.read_text() == "precious"
+    assert not copy.is_symlink() and copy.read_text() == GOOD
+
+
+def test_the_policy_file_is_read_once(
+    tmp_path: Path, home: Path, served: list[Policy], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bytes parsed are the bytes written: a second read of the policy would see the swapped file and the copy would differ."""
+    policy = tmp_path / "policy.yaml"
+    policy.write_text(GOOD)
+    swap = tmp_path / "swap.yaml"
+    swap.write_text(OTHER)
+    copy = copy_of(home)
+    opens: list[Path] = []
+    real_open = Path.open
+
+    def spy(self: Path, *args: Any, **kwargs: Any) -> Any:
+        handle = real_open(self, *args, **kwargs)
+        if self == policy:
+            opens.append(self)
+            if len(opens) == 1:
+                os.replace(swap, policy)
+        return handle
+
+    monkeypatch.setattr(Path, "open", spy)
+    assert start(policy) == 0
+    assert len(opens) == 1
+    assert policy.read_text() == OTHER
+    assert (copy.read_text(), served[0].hosts["workstation"].context) == (GOOD, 32768)

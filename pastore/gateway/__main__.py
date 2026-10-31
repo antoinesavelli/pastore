@@ -6,7 +6,9 @@ Depends on: pastore.policy, pastore.state, pastore.gateway.attribution and serve
 import argparse
 import os
 import sys
+import tempfile
 import time
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -25,9 +27,14 @@ def _log(line: str) -> None:
     print(line, flush=True)
 
 
+def _one_line(text: object) -> str:
+    """Collapse whitespace, so a multi-line error (a YAML syntax error) stays one journal entry."""
+    return " ".join(str(text).split())
+
+
 def _warn(text: str) -> None:
-    """Print to stderr at journald's warning level (`<4>`)."""
-    print(f"<4>pastore gateway: {text}", file=sys.stderr)
+    """Print one line to stderr at journald's warning level (`<4>`)."""
+    print(f"<4>pastore gateway: {_one_line(text)}", file=sys.stderr)
 
 
 def _read(path: Path) -> tuple[bytes, Policy]:
@@ -40,17 +47,22 @@ def _read(path: Path) -> tuple[bytes, Policy]:
 
 
 def _keep_copy(copy: Path, data: bytes) -> None:
-    """Make `copy` hold `data` (atomic replace, only when it differs); warn and go on if the directory is missing or the write fails."""
+    """Make `copy` hold `data` (a fresh temp file, then atomic replace, only when it differs); warn and go on if that fails."""
+    tmp = ""
     try:
         try:
             if copy.read_bytes() == data:
                 return
         except FileNotFoundError:
             pass
-        tmp = copy.with_name(copy.name + ".tmp")
-        tmp.write_bytes(data)
+        fd, tmp = tempfile.mkstemp(dir=copy.parent, prefix=".gateway-policy-")
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
         os.replace(tmp, copy)
     except OSError as exc:
+        if tmp:
+            with suppress(OSError):
+                Path(tmp).unlink(missing_ok=True)
         _warn(f"could not keep the last good policy copy {copy}: {exc}")
 
 
@@ -62,10 +74,8 @@ def _load(path: Path, copy: Path) -> tuple[Policy, Path] | None:
         try:
             policy = _read(copy)[1]
         except PolicyError as copy_exc:
-            print(
-                f"pastore gateway: {exc}\npastore gateway: last good copy: {copy_exc}",
-                file=sys.stderr,
-            )
+            reasons = f"{_one_line(exc)}; last good copy {copy}: {_one_line(copy_exc)}"
+            print(f"pastore gateway: {reasons}", file=sys.stderr)
             return None
         _warn(f"policy {path} failed to load ({exc}); started on the last good copy {copy}")
         return policy, copy
