@@ -1,6 +1,6 @@
 """The fleet dispatcher: each tick heartbeats, honours stop and run-now requests, watches every running job, places the ready ones, and records any foreign workload disruption that overlaps an executor run (R35); a tick is bounded at 60 s (D-050 (6)).
 
-Depends on: policy (PolicyCache), manifest, state (State, rows, lock), checks (Host), hosts (read_host), placement (place), runner, run_end (Active, charge_crash, gateway_outage, oom_killed), tick_bound, contract (Started), spec, workload_watch.
+Depends on: policy (PolicyCache), manifest, state (State, rows, lock), checks (Host), hosts (read_host), placement (place), runner, run_end (Active, NoHandle, charge_crash, charge_failure, oom_killed, outage_reason, poll_run), tick_bound, contract (Started), spec, workload_watch.
 """
 
 import math
@@ -17,16 +17,23 @@ from types import FrameType
 from pastore import workload_watch
 from pastore.checks import Host, host_idle_reason, stopped
 from pastore.contract import Started
-from pastore.hosts import HostState, HttpJson, executor_reason, read_host
+from pastore.hosts import HostState, HttpJson, read_host
 from pastore.manifest import ManifestError
 from pastore.placement import HostLoad, ModelFacts, kv_bytes_per_slot, place
 from pastore.policy import Policy, PolicyCache
-from pastore.run_end import MAX_ATTEMPTS, Active, NoHandle, charge_crash, gateway_outage, oom_killed
+from pastore.run_end import (
+    Active,
+    NoHandle,
+    charge_crash,
+    charge_failure,
+    oom_killed,
+    outage_reason,
+    poll_run,
+)
 from pastore.runner import RunDir, fresh_run_dir, prune_run_dirs, stop_leftovers
 from pastore.spec import (
     BASE_ENV_KEYS,
     RUN_DIR_ENV,
-    WORKSTATION,
     RunReader,
     TaskSpec,
     canonical_model,
@@ -136,11 +143,13 @@ class Dispatcher(CriticalSections):
                 print(f"<4>pastore: workload-overlap {overlap.detail()}", file=sys.stderr)
 
     def _prune(self, now: datetime) -> None:
-        """D-050 (7): once a day, delete run folders over 30 days old except each pair's latest; stamped first, so a failure repeats daily."""
+        """D-050 (7), D-052 (5): once a day, delete run folders over 30 days old except each pair's latest and every run awaiting review; stamped first, so a failure repeats daily."""
         if self._pruned_at is not None and now - self._pruned_at < PRUNE_EVERY:
             return
         self._pruned_at = now
-        gone = prune_run_dirs(self.deps.paths.runs_dir, self.state.latest_run_ids(), now)
+        keep = self.state.latest_run_ids()
+        keep |= {run.run_id for run in self.state.runs_with_status("awaiting-review")}
+        gone = prune_run_dirs(self.deps.paths.runs_dir, keep, now)
         if gone:
             self.state.record_event(now, "runs-pruned", detail=f"{len(gone)} {gone[0]} {gone[-1]}")
 
@@ -167,56 +176,44 @@ class Dispatcher(CriticalSections):
     def _watch_all(self, now: datetime, policy: Policy) -> None:
         for run_id, active in list(self.active.items()):
             with self._critical():
-                outcome = self._poll(now, active)
+                outcome = poll_run(active, now, self.deps.host.run)
                 if outcome is None:
                     continue
                 code, timed_out = outcome
-                lost = self._outage(active, policy, code, timed_out)
+                # R34 order (D-052 (3)): the OOM kill is read first, once; an outage is looked for only if there was none.
+                failed = timed_out or code not in active.spec.ok_exit
+                oom = failed and not timed_out and oom_killed(self.deps.host.run, active)
+                lost = None
+                if failed and not oom:
+                    lost = outage_reason(active, policy, self.deps.http_json, self.deps.ollama_url)
                 if lost is None:
-                    self._finish(active, now, code, timed_out)
+                    self._finish(active, now, code, timed_out, oom)
                 else:
                     self._release(active, now, code, lost)
                 del self.active[run_id]
 
-    def _poll(self, now: datetime, active: Active) -> tuple[int, bool] | None:
-        """The exit code and whether the run timed out, or None while it goes on."""
-        code = active.handle.poll()
-        limit = timedelta(seconds=active.spec.timeout_s)
-        timed_out = code is None and now - active.started_at > limit
-        if timed_out:
-            code = active.handle.stop(self.deps.host.run)
-        return None if code is None else (code, timed_out)
-
-    def _outage(self, active: Active, policy: Policy, code: int, timed_out: bool) -> str | None:
-        """Check 9 and D-050 (4): the idle reason of the outage that cut a non-ok end short, or None when the run is charged."""
-        if not timed_out and code in active.spec.ok_exit:
-            return None
-        host = policy.hosts.get(active.host)
-        if host is not None and host.name != WORKSTATION:
-            if executor_reason(host, self.deps.http_json) is not None:
-                return idle_reason("executor-down")
-        status_url = self.deps.ollama_url + "/pastore/status"
-        down = gateway_outage(self.deps.http_json, status_url, active.started_at)
-        return idle_reason("ollama-down") if down else None
-
     def _release(self, active: Active, now: datetime, code: int, reason: str) -> None:
-        """End a run an outage cut short: stopped, back to pending, no attempt charged."""
+        """D-052 (1): end a run an outage cut short as stopped; the first such end in a row charges nothing, a second charges an attempt as a second crash does."""
         self._end_run(active, now, "stopped", code, reason)
-        self.state.upsert_job(replace(self._job(active.spec, active.model), status="pending"))
+        self._charge(active, now, charge_crash(self._job(active.spec, active.model)))
 
-    def _finish(self, active: Active, now: datetime, code: int, timed_out: bool) -> None:
+    def _charge(self, active: Active, now: datetime, job: JobRow) -> None:
+        """Store the job a non-ok end left; one that reached MAX_ATTEMPTS is `failed` and logs the event."""
+        self.state.upsert_job(job)
+        if job.status == "failed":
+            detail = f"{active.model}: {job.attempts} attempts"
+            self.state.record_event(now, "failed", active.spec.ref, detail)
+
+    def _finish(
+        self, active: Active, now: datetime, code: int, timed_out: bool, oom: bool = False
+    ) -> None:
         spec = active.spec
         job = replace(self._job(spec, active.model), crash_streak=0)
         if not timed_out and code in spec.ok_exit:
             self._read(active, now, job, code)
             return
-        detail = "oom" if not timed_out and oom_killed(self.deps.host.run, active) else ""
-        self._end_run(active, now, "timeout" if timed_out else "failed", code, detail)
-        attempts = job.attempts + 1
-        status = "failed" if attempts >= MAX_ATTEMPTS else "pending"
-        self.state.upsert_job(replace(job, attempts=attempts, status=status))
-        if status == "failed":
-            self.state.record_event(now, "failed", spec.ref, f"{active.model}: {attempts} attempts")
+        self._end_run(active, now, "timeout" if timed_out else "failed", code, "oom" if oom else "")
+        self._charge(active, now, charge_failure(job))
 
     def _read(self, active: Active, now: datetime, job: JobRow, code: int) -> None:
         spec = active.spec

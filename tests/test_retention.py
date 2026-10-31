@@ -1,4 +1,4 @@
-"""Pins run-folder retention (D-050 (7)): old folders go except each pair's latest, run rows stay.
+"""Pins run-folder retention (D-050 (7), D-052 (5)): old folders go except each pair's latest and every run awaiting review, run rows stay.
 
 Depends on: pastore.runner, pastore.state, pastore.dispatcher (the daily prune in a tick, over the dispatcher test Rig)
 and pytest only; fixed datetimes, no real clock.
@@ -8,6 +8,7 @@ import os
 import sqlite3
 import time
 from collections.abc import Callable, Iterator
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -291,6 +292,26 @@ def test_the_first_tick_prunes_an_old_non_latest_folder_and_keeps_each_pairs_lat
     (event,) = rig.events("runs-pruned")
     assert event.detail == f"2 {old} {contract}" and event.ref is None
     assert len(rig.state.runs_with_status("done")) == 4
+
+
+def test_an_awaiting_review_folder_is_never_pruned(tmp_path: Path) -> None:
+    rig = idle_rig(tmp_path)
+    reviewed = seed(rig, "c/a", timedelta(days=90), seq=1)
+    plain = seed(rig, "c/a", timedelta(days=80), seq=2)
+    latest = seed(rig, "c/a", timedelta(days=5), seq=3)
+    run = rig.state.get_run(reviewed)
+    assert run is not None
+    rig.state.update_run(replace(run, status="awaiting-review"))
+    rig.tick()
+    assert sorted(p.name for p in rig.paths.runs_dir.iterdir()) == sorted([reviewed, latest])
+    assert (rig.paths.runs_dir / reviewed / "out" / "result.json").is_file()
+    assert [e.detail for e in rig.events("runs-pruned")] == [f"1 {plain} {plain}"]
+    rig.state.ack(reviewed, rig.clock())
+    rig.clock.advance(PRUNE_EVERY.total_seconds())
+    rig.tick()
+    assert [p.name for p in rig.paths.runs_dir.iterdir()] == [latest]
+    assert rig.events("runs-pruned")[0].detail == f"1 {reviewed} {reviewed}"  # newest first
+    assert len(rig.state.runs_with_status("done")) == 3
 
 
 def test_a_second_tick_inside_24_hours_does_not_prune_and_one_24_hours_later_does(

@@ -1,4 +1,4 @@
-"""R34 executor link drop mid-run: a run cut short by a dead executor is released uncharged and re-placed; the same end with the link up is charged.
+"""R34 executor link drop mid-run: a run cut short by a dead executor is released uncharged the first time (D-052 (1)) and re-placed; the same end with the link up is charged.
 
 Depends on: tests/test_dispatcher.py (Rig, HostSpec, task, host, INFO), the real hosts.http_json over fake-Ollama child processes, a real job via runner.start_run, FakeClock.
 """
@@ -297,12 +297,12 @@ def release_with_the_executor_dead(fleet: Fleet) -> RunRow:
 
 
 def assert_released_uncharged(fleet: Fleet, run: RunRow, exit_code: int) -> None:
-    """The run is `stopped`/`executor-down` on its own host and model, and its pair is pending with nothing charged."""
+    """The run is `stopped`/`executor-down` on its own host and model, and its pair is pending: no attempt charged, one outage end in its streak."""
     ended = fleet.run_row(run)
     assert (ended.status, ended.detail, ended.exit_code) == ("stopped", "executor-down", exit_code)
     assert (ended.host, ended.model, ended.ref) == (EXECUTOR, MODEL, "c/a")
     assert ended.ended_at is not None
-    assert fleet.job_counts() == ("pending", 0, 0)
+    assert fleet.job_counts() == ("pending", 0, 1)
     assert fleet.rig.state.runs_with_status("failed") == []
     assert fleet.rig.state.runs_with_status("timeout") == []
     assert fleet.rig.events("failed") == []
@@ -317,7 +317,8 @@ def test_r34_a_run_cut_by_a_dropped_executor_link_is_released_uncharged_then_rep
     fleet = Fleet(tmp_path, children, "poll")
     run = release_with_the_executor_dead(fleet)
     assert_released_uncharged(fleet, run, 3)
-    assert fleet.journal_calls() == []
+    # The OOM check comes first (D-052 (3)): one kernel-log read, and it finds no kill.
+    assert len(fleet.journal_calls()) == 1
     assert fleet.rig.state.last_run("c/a", MODEL) == fleet.run_row(run)
     fleet.hold_placement(False)
     fleet.tick()
@@ -325,7 +326,7 @@ def test_r34_a_run_cut_by_a_dropped_executor_link_is_released_uncharged_then_rep
     assert again.run_id != run.run_id and (again.ref, again.model) == (run.ref, run.model)
     assert again.host == WORKSTATION
     fleet.wait_polling(again)
-    assert fleet.job_counts() == ("running", 0, 0)
+    assert fleet.job_counts() == ("running", 0, 1)
 
 
 def test_r34_an_executor_back_on_the_same_port_takes_the_released_pair_again(
@@ -342,7 +343,7 @@ def test_r34_an_executor_back_on_the_same_port_takes_the_released_pair_again(
     again = fleet.running()
     assert again.run_id != run.run_id and again.host == EXECUTOR
     fleet.wait_polling(again)
-    assert fleet.job_counts() == ("running", 0, 0)
+    assert fleet.job_counts() == ("running", 0, 1)
     assert fleet.rig.events("failed") == []
 
 

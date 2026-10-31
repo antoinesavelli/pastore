@@ -1592,7 +1592,7 @@ def test_a_run_stays_active_when_the_executor_probe_raises(
     def explode(*_args: object) -> None:
         raise RuntimeError("boom")
 
-    monkeypatch.setattr("pastore.dispatcher.executor_reason", explode)
+    monkeypatch.setattr("pastore.run_end.executor_reason", explode)
     with pytest.raises(RuntimeError):
         rig.tick()
     assert len(rig.d.active) == 1 and len(rig.state.runs_with_status("running")) == 1

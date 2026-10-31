@@ -1,6 +1,6 @@
-"""R34 "job OOM-killed": a job the kernel OOM killer takes is charged as any failure and its run is marked `oom`.
+"""R34 "job OOM-killed": a job the kernel OOM killer takes is charged as any failure and its run is marked `oom`, even when an outage was seen too (D-052 (3)).
 
-Depends on: pastore.dispatcher over the Rig of tests/test_dispatcher.py; real sleeping jobs started by runner.start_run and SIGKILLed; a scripted kernel log.
+Depends on: pastore.dispatcher over the Rig of tests/test_dispatcher.py; real sleeping jobs started by runner.start_run and SIGKILLed; a scripted kernel log; the Gateway fake of tests/test_dispatcher_gateway_outage.py.
 """
 
 import os
@@ -27,6 +27,7 @@ from tests.test_dispatcher import (
     net_of,
     task,
 )
+from tests.test_dispatcher_gateway_outage import Gateway
 
 SLICE = "/user.slice/user-1000.slice/user@1000.service/app.slice"
 CLAUDE_SCOPE = f"{SLICE}/app-com.anthropic.Claude-23510.scope"
@@ -290,7 +291,9 @@ def test_r34_a_stop_never_reads_the_kernel_log(tmp_path: Path) -> None:
     assert reads_of(rig) == []
 
 
-def test_r34_a_release_for_a_lost_executor_never_reads_the_kernel_log(tmp_path: Path) -> None:
+def test_r34_a_release_for_a_lost_executor_reads_the_kernel_log_once_and_finds_no_kill(
+    tmp_path: Path,
+) -> None:
     rig = fleet_rig(tmp_path, net_of({}, {"only": GIB}), [("c/a", "only")], models=("only",))
     rig.next_codes = [1]
     rig.tick()
@@ -300,7 +303,36 @@ def test_r34_a_release_for_a_lost_executor_never_reads_the_kernel_log(tmp_path: 
     rig.tick()
     ended = rig.state.get_run(run.run_id)
     assert ended is not None and (ended.status, ended.detail) == ("stopped", "executor-down")
-    assert reads_of(rig) == []
+    assert reads_of(rig) == [journalctl_argv(T0.timestamp())]
+
+
+@pytest.mark.parametrize("down", ["gateway", "executor"])
+def test_an_oom_kill_is_charged_even_during_an_outage(tmp_path: Path, down: str) -> None:
+    net = net_of({}, {"only": GIB})
+    gateway = Gateway(net)
+    rig = fleet_rig(tmp_path, net, [("c/a", "only")], models=("only",), http_json=gateway)
+    rig.next_codes = [1]
+    rig.tick()
+    [run] = rig.state.runs_with_status("running")
+    assert run.host == EXECUTOR
+    runner = rig.deps.host.run
+    assert isinstance(runner, RecordingRunner)
+    runner.results["journalctl"] = RecordingRunner.ok(log(global_oom(pastore_scope(run.run_id))))
+    rig.paths.stop_file.write_text("")
+    if down == "gateway":
+        gateway.answer = OSError("down")
+    else:
+        net.version_down.add(EX_URL)
+    probes, status_reads = len(net.calls), gateway.reads
+    rig.tick()
+    ended = rig.state.get_run(run.run_id)
+    job = rig.state.get_job("c/a", "only")
+    assert ended is not None and job is not None
+    assert (ended.status, ended.detail, ended.exit_code) == ("failed", "oom", 1)
+    assert (job.status, job.attempts, job.crash_streak) == ("pending", 1, 0)
+    assert [e.detail for e in rig.events("run-end")] == [f"{run.run_id} failed 1 oom"]
+    assert reads_of(rig) == [journalctl_argv(T0.timestamp())]
+    assert gateway.reads == status_reads and net.calls[probes:] == []
 
 
 def test_r34_a_job_that_never_started_is_not_an_oom_kill(tmp_path: Path) -> None:
