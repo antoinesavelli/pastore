@@ -218,8 +218,9 @@ class _Gateway:
         """403 for a model-changing, account or web-fetching route from a peer that is not on this machine (D-050 (9c), D-052 (4)); None for anything else.
 
         A path is refused when it matches with its slashes collapsed or with its dot segments also resolved: the
-        gateway relays the path as sent and Ollama does not clean it, so `/api/user/keys/..` is the key route
-        with the parameter `..` (it signs the machine out), though resolved it reads `/api/user`.
+        gateway relays the path as sent and Ollama's router does not resolve an escaped `%2e%2e`, so
+        `/api/user/keys/%2e%2e` is the key route with the parameter `..` (it signs the machine out), though
+        resolved it reads `/api/user`.
         """
         collapsed = re.sub("/+", "/", path)
         routes = (collapsed, posixpath.normpath(collapsed))
