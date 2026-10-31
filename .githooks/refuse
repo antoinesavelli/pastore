@@ -4,3 +4,5 @@
 *.db-shm
 dispatcher.lock
 */dispatcher.lock
+# The real policy is private; policy.example.yaml is the tracked placeholder.
+policy.yaml

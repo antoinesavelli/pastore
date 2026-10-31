@@ -7,3 +7,5 @@ __pycache__/
 .coverage
 .worktrees/
 .env
+# The real policy is private: copy policy.example.yaml to policy.yaml and fill in your own hosts and jobs.
+/policy.yaml

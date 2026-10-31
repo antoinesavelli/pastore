@@ -1,16 +1,16 @@
-# Text for ~/.config/systemd/user/pastore-gateway.service (R20, R33). Not installed by the repo: the cutover fix
-# a private script installs it.
+# Template for ~/.config/systemd/user/pastore-gateway.service (R20, R33). Copy it, check that the checkout is at
+# ~/pastore and that Ollama has been moved to 127.0.0.1:11435, then `systemctl --user daemon-reload`.
+# Not installed by the repo.
 [Unit]
 Description=pastore gateway: the Ollama front door on :11434, priority by source (forwards to Ollama on 127.0.0.1:11435)
-Documentation=file:/srv/projects/pastore/docs/STATUS.md
+Documentation=file:%h/pastore/docs/DESIGN.md
 StartLimitIntervalSec=60
 StartLimitBurst=10
-OnFailure=unit-failed@%n.service
 
 [Service]
 Type=simple
-WorkingDirectory=/srv/projects/pastore
-ExecStart=/srv/projects/pastore/.venv/bin/python -m pastore.gateway --policy /srv/projects/pastore/policy.yaml --host 0.0.0.0 --port 11434
+WorkingDirectory=%h/pastore
+ExecStart=%h/pastore/.venv/bin/python -m pastore.gateway --policy %h/pastore/policy.yaml --host 0.0.0.0 --port 11434
 Restart=always
 RestartSec=1
 MemoryMax=2G

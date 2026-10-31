@@ -1,6 +1,6 @@
 """R34 "gateway killed mid-stream" (check 14): SIGKILL a real gateway with one stream in flight and one caller queued.
 
-Depends on: pastore.gateway run as a child process, tests.gateway_fakes (the fake Ollama child), the repo's policy.yaml, PyYAML and pytest; binds 127.0.0.1 port 0 only.
+Depends on: pastore.gateway run as a child process, tests.gateway_fakes (the fake Ollama child), the repo's policy.example.yaml, PyYAML and pytest; binds 127.0.0.1 port 0 only.
 """
 
 import http.client
@@ -21,7 +21,7 @@ import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
-REPO_POLICY = ROOT / "policy.yaml"
+EXAMPLE_POLICY = ROOT / "policy.example.yaml"
 READY_S = 10.0
 SOCKET_GUARD_S = 15.0
 SEEN_WITHIN_S = 2.0
@@ -221,10 +221,10 @@ def rig(tmp_path: Path) -> Iterator[Rig]:
     rig = Rig(tmp_path, upstream, _free_port(), tmp_path / "policy.yaml", env)
     try:
         upstream_url = _wait_for_url(upstream, upstream_log)
-        policy = yaml.safe_load(REPO_POLICY.read_text())
+        policy = yaml.safe_load(EXAMPLE_POLICY.read_text())
         policy["hosts"]["workstation"].update(url=upstream_url, parallel=1, max_models=1)
-        policy["hosts"]["executor"]["url"] = f"http://127.0.0.1:{_free_port()}"
-        assert set(policy["hosts"]) == {"workstation", "executor"}, "a host here keeps a live url"
+        (other,) = set(policy["hosts"]) - {"workstation"}  # a second host here keeps a live url
+        policy["hosts"][other]["url"] = f"http://127.0.0.1:{_free_port()}"
         rig.policy.write_text(yaml.safe_dump(policy))
         yield rig
     finally:
