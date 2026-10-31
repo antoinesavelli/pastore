@@ -215,9 +215,15 @@ class _Gateway:
         return web.json_response({"hosts": hosts, "started_at": self._started_at})
 
     async def _refuse_off_machine(self, request: web.Request, path: str) -> web.Response | None:
-        """403 for a model-changing, account or web-fetching route from a peer that is not on this machine (D-050 (9c), D-052 (4)); None for anything else."""
-        route = posixpath.normpath(re.sub("/+", "/", path))
-        if route not in REFUSED_PATHS and not f"{route}/".startswith(REFUSED_PREFIXES):
+        """403 for a model-changing, account or web-fetching route from a peer that is not on this machine (D-050 (9c), D-052 (4)); None for anything else.
+
+        A path is refused when it matches with its slashes collapsed or with its dot segments also resolved: the
+        gateway relays the path as sent and Ollama does not clean it, so `/api/user/keys/..` is the key route
+        with the parameter `..` (it signs the machine out), though resolved it reads `/api/user`.
+        """
+        collapsed = re.sub("/+", "/", path)
+        routes = (collapsed, posixpath.normpath(collapsed))
+        if not any(r in REFUSED_PATHS or f"{r}/".startswith(REFUSED_PREFIXES) for r in routes):
             return None
         try:
             (peer, _), (local, _) = _endpoints(request)
