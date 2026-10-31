@@ -1,4 +1,4 @@
-"""R35 foreign-workload watch: a workload on a second host, read from its journal, against executor run spans; records and alerts only.
+"""R35 foreign-workload watch: log lines of watched units in this machine's journal against executor run spans; records and alerts only.
 
 Depends on: pastore.runner (Runner), pastore.spec (WatchConfig, Signal) and stdlib; the journal is read on the workstation through an injected runner.
 """

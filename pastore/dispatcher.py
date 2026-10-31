@@ -121,7 +121,7 @@ class Dispatcher(CriticalSections):
         return True
 
     def _watch_workload(self, now: datetime, config: WatchConfig | None) -> None:
-        """R35: read a foreign workload's journal against the executor runs and record a new overlap; it never acts on a run."""
+        """R35: read the watched units' lines in this machine's journal against the executor runs and record a new overlap; it never acts on a run."""
         if config is None:
             self.state.set_workload_watch("off")
             return

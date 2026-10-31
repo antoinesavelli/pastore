@@ -8,6 +8,7 @@ import json
 import sqlite3
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import closing
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -599,7 +600,7 @@ def test_check_15_a_state_with_the_retired_rows_still_opens_and_the_watch_works(
 ) -> None:
     w = Wired(tmp_path)
     old_event = "r0 link 2026-10-23T01:00:00Z run=r0 c/a run=a..b signal=link disruption=a..ongoing"
-    with sqlite3.connect(w.rig.paths.db) as conn:
+    with closing(sqlite3.connect(w.rig.paths.db)) as conn, conn:
         conn.execute(
             "INSERT INTO events(at, ref, kind, detail) VALUES(?, 'c/a', ?, ?)",
             (T0.isoformat(), f"{RETIRED}-overlap", old_event),
@@ -622,7 +623,7 @@ def test_check_15_a_state_with_the_retired_rows_still_opens_and_the_watch_works(
         f"workload-overlap: {event.at} {DETAIL}",
         "run pastore ack-workload once reviewed",
     ]
-    with sqlite3.connect(w.rig.paths.db) as conn:
+    with closing(sqlite3.connect(w.rig.paths.db)) as conn:
         kept = conn.execute("SELECT COUNT(*) FROM events WHERE kind=?", (f"{RETIRED}-overlap",))
         assert kept.fetchone() == (1,)
         meta = conn.execute("SELECT value FROM meta WHERE key=?", (f"{RETIRED}_watch",))
