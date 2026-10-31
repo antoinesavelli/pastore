@@ -1,6 +1,6 @@
-"""The fleet dispatcher: each tick heartbeats, honours stop and run-now requests, watches every running job, and places the ready ones.
+"""The fleet dispatcher: each tick heartbeats, honours stop and run-now requests, watches every running job, places the ready ones, and records any foreign workload disruption that overlaps an executor run (R35).
 
-Depends on: policy (PolicyCache), manifest, state (State, rows, lock), checks (Host), hosts (read_host), placement (place), runner, contract (Started), spec.
+Depends on: policy (PolicyCache), manifest, state (State, rows, lock), checks (Host), hosts (read_host), placement (place), runner, contract (Started), spec, workload_watch.
 """
 
 import math
@@ -14,13 +14,14 @@ from pathlib import Path
 from subprocess import CompletedProcess
 from types import FrameType
 
+from pastore import workload_watch
 from pastore.checks import Host, host_idle_reason, stopped
 from pastore.contract import Started
 from pastore.hosts import HostState, HttpJson, executor_reason, read_host
 from pastore.manifest import ManifestError
 from pastore.placement import HostLoad, ModelFacts, kv_bytes_per_slot, place
 from pastore.policy import Policy, PolicyCache
-from pastore.runner import RunDir, fresh_run_dir, stop_leftovers
+from pastore.runner import RunDir, Runner, fresh_run_dir, stop_leftovers
 from pastore.spec import BASE_ENV_KEYS, WORKSTATION, RunReader, TaskSpec, idle_reason
 from pastore.state import DispatcherLock, JobRow, RunRow, State, StatePaths, open_state
 
@@ -104,9 +105,35 @@ class Dispatcher:
             return False
         self._watch_all(now, policy)
         if self.draining:
-            return bool(self.active)
-        self._dispatch(now, policy)
+            if not self.active:
+                return False
+        else:
+            self._dispatch(now, policy)
+        self._watch_workload(now)
         return True
+
+    def _watch_workload(self, now: datetime) -> None:
+        """R35: read the workload's journal against the executor runs and record a new overlap; it never acts on a run."""
+        spans = [
+            workload_watch.Span(
+                row.run_id,
+                row.ref,
+                datetime.fromisoformat(row.started_at),
+                None if row.ended_at is None else datetime.fromisoformat(row.ended_at),
+            )
+            for row in self.state.executor_runs(now - workload_watch.KEEP_AFTER_END)
+        ]
+        found = workload_watch.watch(now, spans, workload_watch.journal_reader(self.deps.host.run))
+        self.state.set_workload_watch(found.status)
+        for overlap in found.overlaps:
+            if not self.state.has_event("workload-overlap", overlap.key()):
+                self.state.record_event(
+                    now,
+                    "workload-overlap",
+                    overlap.span.ref,
+                    f"{overlap.key()} {overlap.detail()}",
+                )
+                print(f"<4>pastore: workload-overlap {overlap.detail()}", file=sys.stderr)
 
     def _handle_stop_request(self, now: datetime) -> bool:
         mode = "sigterm" if self.terminated else self.state.stop_requested()
@@ -168,7 +195,8 @@ class Dispatcher:
         if not timed_out and code in spec.ok_exit:
             self._read(active, now, job, code)
             return
-        self._end_run(active, now, "timeout" if timed_out else "failed", code)
+        detail = "oom" if not timed_out and _oom_killed(self.deps.host.run, active) else ""
+        self._end_run(active, now, "timeout" if timed_out else "failed", code, detail)
         attempts = job.attempts + 1
         status = "failed" if attempts >= MAX_ATTEMPTS else "pending"
         self.state.upsert_job(replace(job, attempts=attempts, status=status))
@@ -434,6 +462,23 @@ def _hold(loads: list[HostLoad], host: str, model: str) -> None:
     """Count a run just started on `host` as held there, for the units placed after it this tick."""
     index = next(i for i, load in enumerate(loads) if load.host.name == host)
     loads[index] = replace(loads[index], held=(*loads[index].held, model))
+
+
+def _oom_killed(run: Runner, active: Active) -> bool:
+    """True when this boot's kernel log holds an OOM kill whose victim sat in the run's own scope."""
+    if isinstance(active.handle, _NoHandle):
+        return False
+    since = int(active.started_at.timestamp())
+    result = run(["journalctl", "-k", "-o", "cat", "--no-pager", f"--since=@{since}"])
+    if result.returncode != 0:
+        return False
+    scope = f"/pastore-{active.run_id}.scope"
+    return any(
+        field.startswith("task_memcg=") and field.endswith(scope)
+        for line in result.stdout.splitlines()
+        if line.startswith("oom-kill:")
+        for field in line.split(",")
+    )
 
 
 def _charge_crash(job: JobRow) -> JobRow:

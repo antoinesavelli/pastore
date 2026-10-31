@@ -1,4 +1,4 @@
-"""The pastore command line: start, stop, status (state plus the gateway's /pastore/status), add/remove (gated), check [--contract], run-now, rerun, ack, reset.
+"""The pastore command line: start, stop, status (state plus the gateway's /pastore/status), add/remove (gated), check [--contract], run-now, rerun, ack, ack-workload, reset.
 
 Depends on: spec (Level, Pair, TaskSpec), policy, manifest, state, dispatcher (serve), contract, hosts (HttpJson, injected for the gateway read), checks/runner real bindings; binds the real clock only here.
 """
@@ -55,6 +55,7 @@ SUBPROCESS_TIMEOUT_S = 45
 GATEWAY_TIMEOUT_S = 2.0
 LEVEL_NAMES = tuple(level.name.lower() for level in Level)
 TEXT_MAX_CHARS = 80
+OVERLAP_MAX_CHARS = 300
 HOST_NAME = re.compile(r"[A-Za-z0-9._-]{1,64}")
 DEFAULT_POLICY = Path(__file__).resolve().parent.parent / "policy.yaml"
 
@@ -100,6 +101,7 @@ def _parser() -> argparse.ArgumentParser:
     check.add_argument("path", nargs="?", type=Path)
     check.add_argument("--contract", metavar="REF")
     sub.add_parser("ack").add_argument("run_id")
+    sub.add_parser("ack-workload")
     return parser
 
 
@@ -177,10 +179,10 @@ def _gateway_lines(answer: object) -> list[str]:
     return [_gateway_line(host, entry) for host, entry in table.items()]
 
 
-def _oneline(text: str) -> str:
-    """Gateway text made safe to print: control characters become spaces, whitespace collapses, 80 characters at most."""
+def _oneline(text: str, limit: int = TEXT_MAX_CHARS) -> str:
+    """Text made safe to print: control characters become spaces, whitespace collapses, `limit` characters at most."""
     flat = " ".join("".join(c if c.isprintable() else " " for c in text).split())
-    return flat if len(flat) <= TEXT_MAX_CHARS else flat[: TEXT_MAX_CHARS - 3] + "..."
+    return flat if len(flat) <= limit else flat[: limit - 3] + "..."
 
 
 def _say_gateway(ctx: Ctx) -> None:
@@ -204,6 +206,18 @@ def _tick_error_lines(state: State) -> list[str]:
     return [f"last tick-error: {errors[0].at} {errors[0].detail}"] if errors else []
 
 
+def _workload_lines(state: State) -> list[str]:
+    """The R35 watch status, then one line per overlap not yet acked, then how to ack them."""
+    lines = [f"workload watch: {_oneline(state.workload_watch() or 'not run yet')}"]
+    unacked = state.unacked_workload_overlaps()
+    for event in unacked:
+        text = f"workload-overlap: {event.at} {event.detail.split(' ', 3)[-1]}"
+        lines.append(_oneline(text, OVERLAP_MAX_CHARS))
+    if unacked:
+        lines.append("run pastore ack-workload once reviewed")
+    return lines
+
+
 def _status(ctx: Ctx, _args: argparse.Namespace) -> int:
     if not ctx.paths.db.exists():
         _say(ctx, "no state yet")
@@ -214,6 +228,8 @@ def _status(ctx: Ctx, _args: argparse.Namespace) -> int:
         _say(ctx, f"dispatcher: {'up' if up else 'dispatcher-down'}")
         _say(ctx, f"idle: {state.idle_reason() or 'none'}")
         for line in _tick_error_lines(state):
+            _say(ctx, line)
+        for line in _workload_lines(state):
             _say(ctx, line)
         try:
             jobs = load_policy(ctx.policy_path).jobs
@@ -330,6 +346,15 @@ def _ack(ctx: Ctx, args: argparse.Namespace) -> int:
     return 0
 
 
+def _ack_workload(ctx: Ctx, _args: argparse.Namespace) -> int:
+    if not ctx.paths.db.exists():
+        raise StateError("no state yet")
+    with closing(open_state(ctx.paths)) as state:
+        cleared = state.ack_workload(ctx.clock())
+    _say(ctx, f"acked {cleared} workload-overlap event(s)")
+    return 0
+
+
 def _reset(ctx: Ctx, _args: argparse.Namespace) -> int:
     deleted = reset(ctx.paths)
     _say(ctx, "\n".join(f"deleted {p}" for p in deleted) or "nothing to delete")
@@ -432,6 +457,7 @@ HANDLERS: dict[str, Callable[[Ctx, argparse.Namespace], int]] = {
     "check": _check,
     "rerun": _rerun,
     "ack": _ack,
+    "ack-workload": _ack_workload,
     "reset": _reset,
     "start": _start,
     "run-now": _run_now,

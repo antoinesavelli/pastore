@@ -405,6 +405,7 @@ def test_status_lists_running_and_awaiting_review_runs_before_the_gateway(env: E
         0,
         "dispatcher: dispatcher-down\n"
         "idle: none\n"
+        "workload watch: not run yet\n"
         "torra/bench qwen3:8b: running attempts=1 last_run=running host=executor\n"
         "torra/bench gemma3:4b: unseen attempts=0 last_run=awaiting-review host=workstation\n"
         "awaiting review: r1 (torra/bench gemma3:4b)\n"
@@ -652,9 +653,13 @@ def test_status_with_an_invalid_policy_exits_1_and_prints_no_gateway_line(env: E
     env.gateway.answer = two_hosts()
     code, out = env.run("status")
     lines = out.splitlines()
-    assert code == 1 and lines[:2] == ["dispatcher: dispatcher-down", "idle: none"]
-    assert lines[2].startswith("policy error: ") and "version must be 2" in lines[2]
-    assert len(lines) == 3 and "gateway" not in out
+    assert code == 1 and lines[:3] == [
+        "dispatcher: dispatcher-down",
+        "idle: none",
+        "workload watch: not run yet",
+    ]
+    assert lines[3].startswith("policy error: ") and "version must be 2" in lines[3]
+    assert len(lines) == 4 and "gateway" not in out
     assert env.gateway.calls == []
 
 

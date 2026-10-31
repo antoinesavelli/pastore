@@ -13,7 +13,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, Literal, Self
 
-from pastore.spec import TASK_EVENTS, idle_reason
+from pastore.spec import TASK_EVENTS, WORKSTATION, idle_reason
 
 SCHEMA_VERSION = 2
 DISPATCHER_EVENTS = (
@@ -25,6 +25,8 @@ DISPATCHER_EVENTS = (
     "run-start",
     "run-end",
     "tick-error",
+    "workload-overlap",
+    "workload-ack",
 )
 SCHEMA = """
 CREATE TABLE jobs(
@@ -169,7 +171,8 @@ def open_state(paths: StatePaths, *, readonly: bool = False) -> "State":
             raise StateError("no state yet")
     else:
         paths.state_dir.mkdir(parents=True, exist_ok=True)
-        if paths.db.exists():
+        # a read-only connection cannot roll back a hot journal a kill left: the probe would fail forever
+        if paths.db.exists() and not paths.db.with_name(paths.db.name + "-journal").exists():
             probe = _connect_ro(paths)
             _check_version(probe, paths)
             probe.close()
@@ -324,6 +327,60 @@ class State:
             "SELECT * FROM runs WHERE status=? ORDER BY started_at, run_id", (status,)
         )
         return [RunRow(*row) for row in rows]
+
+    def executor_runs(self, since: datetime) -> list[RunRow]:
+        """Runs on a host other than the workstation that are still running or ended at or after `since`, oldest first."""
+        rows = self._conn.execute(
+            "SELECT * FROM runs WHERE host<>? AND (status='running' OR ended_at>=?) "
+            "ORDER BY started_at, run_id",
+            (WORKSTATION, _iso(since)),
+        )
+        return [RunRow(*row) for row in rows]
+
+    def has_event(self, kind: str, detail: str) -> bool:
+        """Whether an event of this kind has exactly this detail, or this detail followed by a space and more."""
+        row = self._one(
+            "SELECT 1 FROM events WHERE kind=? AND (detail=? OR substr(detail, 1, ?)=?) LIMIT 1",
+            (kind, detail, len(detail) + 1, detail + " "),
+        )
+        return row is not None
+
+    def set_workload_watch(self, text: str) -> None:
+        """Store the R35 watch status (armed, down, no-signal, unreadable: ...)."""
+        with self._conn:
+            self._set_meta("workload_watch", text)
+
+    def workload_watch(self) -> str | None:
+        """The R35 watch status the dispatcher last stored, if any."""
+        return self._meta("workload_watch")
+
+    def _workload_acked_id(self) -> int:
+        raw = self._meta("workload_acked_id")
+        if raw is None:
+            return 0
+        if not (raw.isascii() and raw.isdigit()):
+            raise StateError(f"meta workload_acked_id is not a number: {raw!r}")
+        return int(raw)
+
+    def unacked_workload_overlaps(self) -> list[EventRow]:
+        """The `workload-overlap` events recorded since the last `ack_workload`, oldest first."""
+        rows = self._conn.execute(
+            "SELECT id, at, ref, kind, detail FROM events WHERE kind='workload-overlap' AND id>? "
+            "ORDER BY id",
+            (self._workload_acked_id(),),
+        )
+        return [EventRow(*row) for row in rows]
+
+    def ack_workload(self, now: datetime) -> int:
+        """Mark every recorded `workload-overlap` event reviewed, log a `workload-ack` event, and return how many were cleared."""
+        acked = self._workload_acked_id()
+        count, newest = self._conn.execute(
+            "SELECT COUNT(*), MAX(id) FROM events WHERE kind='workload-overlap' AND id>?", (acked,)
+        ).fetchone()
+        with self._conn:
+            self._set_meta("workload_acked_id", str(max(acked, newest or 0)))
+            self._event(now, "workload-ack", None, f"cleared {count}")
+        return int(count)
 
     def request_stop(self, mode: Literal["graceful", "now"]) -> None:
         """Ask the dispatcher to exit (after the running job, or now)."""
