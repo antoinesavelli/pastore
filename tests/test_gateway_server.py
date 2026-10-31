@@ -1296,11 +1296,22 @@ def test_the_upstream_session_has_no_total_timeout_a_connect_timeout_and_the_idl
     run(scenario())
 
 
-# --- model-changing routes only from this machine (D-050 (9c)) -------------------------------------------------
+# --- model-changing, account and web-fetching routes only from this machine (D-050 (9c), D-052 (4)) -----------
 
 LAN, EXECUTOR_IP = "192.0.2.5", "192.0.2.101"
-MODEL_CHANGE = ("/api/pull", "/api/delete", "/api/create", "/api/copy", "/api/push")
-REFUSED = {"error": "model-changing routes are refused from off this machine"}
+REFUSED_ROUTES = (
+    "/api/pull",
+    "/api/delete",
+    "/api/create",
+    "/api/copy",
+    "/api/push",
+    "/api/blobs/sha256-abc",
+    "/api/signout",
+    "/api/user/keys/abc",
+    "/api/experimental/web_fetch",
+    "/api/experimental/web_search",
+)
+REFUSED = {"error": "this route is refused from off this machine"}
 
 
 HOST_FIB_TRIE = """\
@@ -1341,11 +1352,11 @@ def test_invariant_model_changing_routes_are_refused_off_this_machine(
         async with rig(tmp_path, extra_hosts=("executor",)) as r:
             for peer in (LAN, EXECUTOR_IP, f"::ffff:{LAN}"):
                 peer_is(monkeypatch, peer)
-                for path in MODEL_CHANGE:
+                for path in REFUSED_ROUTES:
                     reply = await r.send("POST", path, {"model": "m"})
                     assert reply.status == 403 and json.loads(reply.body) == REFUSED
                     assert f"refused route={path} peer={peer}" in r.lines
-            assert len(r.lines) == 3 * len(MODEL_CHANGE) and r.journal() == []
+            assert len(r.lines) == 3 * len(REFUSED_ROUTES) and r.journal() == []
             assert not any(fake.requests for fake in r.fakes.values())
 
     run(scenario())
@@ -1361,16 +1372,16 @@ def test_invariant_model_changing_routes_are_refused_off_this_machine(
         (LAN, LAN),
     ],
 )
-def test_model_changing_routes_are_relayed_from_this_machine(
+def test_refused_routes_are_relayed_from_this_machine(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, peer: str, local: str
 ) -> None:
     async def scenario() -> None:
         async with rig(tmp_path) as r:
             peer_is(monkeypatch, peer, local)
-            for path in MODEL_CHANGE:
+            for path in REFUSED_ROUTES:
                 reply = await r.send("POST", path, {"model": "m"})
                 assert reply.status == 200 and reply.headers["X-Upstream-Tag"] == WORKSTATION
-            assert [x.target for x in r.fakes[WORKSTATION].requests] == list(MODEL_CHANGE)
+            assert [x.target for x in r.fakes[WORKSTATION].requests] == list(REFUSED_ROUTES)
             assert r.lines == []
 
     run(scenario())
@@ -1390,9 +1401,24 @@ def test_model_changing_routes_are_relayed_from_this_machine(
         ("DELETE", "/api/delete"),
         ("GET", "/api/pull"),
         ("PUT", "/api/copy"),
+        ("POST", "/api/blobs"),
+        ("HEAD", "/api/blobs/sha256-abc"),
+        ("POST", "//api/blobs/x"),
+        ("POST", "/api/blobs/"),
+        ("POST", "/api/blobs%2Fsha256-abc"),
+        ("POST", "/api/blobs/x/../y"),
+        ("POST", "/api/./signout"),
+        ("GET", "/api/%73ignout"),
+        ("POST", "/api/user/keys"),
+        ("GET", "/api/user/keys/"),
+        ("DELETE", "/api/user/keys/abc"),
+        ("POST", "/api/user%2Fkeys/abc"),
+        ("GET", "/api/experimental/web_fetch"),
+        ("POST", "/api/experimental//web_search/"),
+        ("POST", "/api/experimental/web%5Ffetch?x=1"),
     ],
 )
-def test_model_changing_variants_and_any_method_are_refused_off_this_machine(
+def test_refused_variants_and_any_method_are_refused_off_this_machine(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method: str, target: str
 ) -> None:
     async def scenario() -> None:
@@ -1463,9 +1489,15 @@ def test_every_other_route_still_goes_through_from_a_lan_peer(
         ("GET", "/api/ps"),
         ("POST", "/api/show"),
         ("GET", "/api/version"),
-        ("POST", "/api/blobs/sha256:abc"),
         ("POST", "/api/pulled"),
         ("POST", "/api/pull/x"),
+        ("POST", "/api/blobsx"),
+        ("POST", "/api/blobsx/y"),
+        ("GET", "/api/user"),
+        ("POST", "/api/user/keysx"),
+        ("GET", "/api/user/keysx/abc"),
+        ("POST", "/api/signoutx"),
+        ("POST", "/api/experimental/web_fetchx"),
     ]
 
     async def scenario() -> None:

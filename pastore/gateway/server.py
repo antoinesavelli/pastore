@@ -38,9 +38,19 @@ DROP_REQUEST = HOP_BY_HOP | {"host", "content-length"}
 DROP_RESPONSE = HOP_BY_HOP | {"content-length", "date", "server"}
 GATED_PATHS = frozenset({"/api/generate", "/api/chat", "/api/embed", "/api/embeddings"})
 GATED_PREFIX = "/v1/"
-MODEL_CHANGE_PATHS = frozenset(
-    {"/api/pull", "/api/delete", "/api/create", "/api/copy", "/api/push"}
+REFUSED_PATHS = frozenset(
+    {
+        "/api/pull",
+        "/api/delete",
+        "/api/create",
+        "/api/copy",
+        "/api/push",
+        "/api/signout",
+        "/api/experimental/web_fetch",
+        "/api/experimental/web_search",
+    }
 )
+REFUSED_PREFIXES = ("/api/blobs/", "/api/user/keys/")
 DOCKER_NET = ipaddress.IPv4Network("172.17.0.0/16")
 SKIP_AUTO_HEADERS = ("Accept", "Accept-Encoding", "Content-Type", "User-Agent")
 CONNECT_TIMEOUT_S = 3.0
@@ -190,7 +200,7 @@ class _Gateway:
             return self._pastore(request)
         if request.method == "POST" and (path in GATED_PATHS or path.startswith(GATED_PREFIX)):
             return await self._gated(request)
-        if (refusal := await self._refuse_model_change(request, path)) is not None:
+        if (refusal := await self._refuse_off_machine(request, path)) is not None:
             return refusal
         data = request.content if request.can_read_body else None
         return await self._relay(request, self._policy.hosts[WORKSTATION].url, data, _Journal())
@@ -204,9 +214,10 @@ class _Gateway:
         hosts = {name: asdict(queue.snapshot()) for name, queue in self._queues.items()}
         return web.json_response({"hosts": hosts, "started_at": self._started_at})
 
-    async def _refuse_model_change(self, request: web.Request, path: str) -> web.Response | None:
-        """403 for a model-changing route from a peer that is not on this machine; None for anything else."""
-        if posixpath.normpath(re.sub("/+", "/", path)) not in MODEL_CHANGE_PATHS:
+    async def _refuse_off_machine(self, request: web.Request, path: str) -> web.Response | None:
+        """403 for a model-changing, account or web-fetching route from a peer that is not on this machine (D-050 (9c), D-052 (4)); None for anything else."""
+        route = posixpath.normpath(re.sub("/+", "/", path))
+        if route not in REFUSED_PATHS and not f"{route}/".startswith(REFUSED_PREFIXES):
             return None
         try:
             (peer, _), (local, _) = _endpoints(request)
@@ -217,7 +228,7 @@ class _Gateway:
         ):
             return None
         self._log(f"refused route={_token(path)} peer={_token(peer)}")
-        error = "model-changing routes are refused from off this machine"
+        error = "this route is refused from off this machine"
         return web.json_response({"error": error}, status=403)
 
     async def _gated(self, request: web.Request) -> web.StreamResponse:
@@ -339,7 +350,7 @@ def make_app(
 
     `started_at` is the gateway's start as UTC ISO-8601; `/pastore/status` reports it, so the dispatcher can tell a
     run that a gateway restart cut short (D-050 (4)). A relayed reply that gets no bytes from the upstream for
-    `upstream_idle_s` is ended. `proc` is where the model-changing routes' peer check reads the host's own addresses.
+    `upstream_idle_s` is ended. `proc` is where the refused routes' peer check reads the host's own addresses.
     """
     gateway = _Gateway(policy, attribute, state_paths, clock, log, starve_after_s, started_at, proc)
     app = web.Application(client_max_size=MAX_BODY_BYTES, handler_args={"auto_decompress": False})
