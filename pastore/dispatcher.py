@@ -1,6 +1,6 @@
-"""The fleet dispatcher: each tick heartbeats, honours stop and run-now requests, watches every running job, places the ready ones, and records any foreign workload disruption that overlaps an executor run (R35).
+"""The fleet dispatcher: each tick heartbeats, honours stop and run-now requests, watches every running job, places the ready ones, and records any foreign workload disruption that overlaps an executor run (R35); a tick is bounded at 60 s (D-050 (6)).
 
-Depends on: policy (PolicyCache), manifest, state (State, rows, lock), checks (Host), hosts (read_host), placement (place), runner, contract (Started), spec, workload_watch.
+Depends on: policy (PolicyCache), manifest, state (State, rows, lock), checks (Host), hosts (read_host), placement (place), runner, run_end (Active, gateway_outage, oom_killed), tick_bound, contract (Started), spec, workload_watch.
 """
 
 import math
@@ -21,7 +21,8 @@ from pastore.hosts import HostState, HttpJson, executor_reason, read_host
 from pastore.manifest import ManifestError
 from pastore.placement import HostLoad, ModelFacts, kv_bytes_per_slot, place
 from pastore.policy import Policy, PolicyCache
-from pastore.runner import RunDir, Runner, fresh_run_dir, stop_leftovers
+from pastore.run_end import Active, NoHandle, gateway_outage, oom_killed
+from pastore.runner import RunDir, fresh_run_dir, stop_leftovers
 from pastore.spec import (
     BASE_ENV_KEYS,
     RUN_DIR_ENV,
@@ -32,6 +33,7 @@ from pastore.spec import (
     idle_reason,
 )
 from pastore.state import DispatcherLock, JobRow, RunRow, State, StatePaths, open_state
+from pastore.tick_bound import TICK_BOUND_S, CriticalSections, bounded
 
 MAX_ATTEMPTS = 3
 STARVED_AFTER = timedelta(hours=24)
@@ -57,25 +59,12 @@ class Deps:
     http_json: HttpJson
 
 
-@dataclass(frozen=True)
-class Active:
-    """One running job and the host it was placed on."""
-
-    spec: TaskSpec
-    model: str
-    host: str
-    run_id: str
-    run_dir: RunDir
-    started_at: datetime
-    handle: Started
-
-
 def iso(now: datetime) -> str:
     """UTC ISO-8601 text, the timestamp form stored in state."""
     return now.astimezone(UTC).isoformat()
 
 
-class Dispatcher:
+class Dispatcher(CriticalSections):
     """One dispatcher; `serve` holds the lock and owns the loop and the clock."""
 
     def __init__(self, deps: Deps, state: State, policy: PolicyCache) -> None:
@@ -107,6 +96,7 @@ class Dispatcher:
 
     def tick(self, now: datetime) -> bool:
         """Run one decision step; False means the dispatcher should exit."""
+        self._late = None
         self.state.heartbeat(now)
         policy = self.policy.current()
         if not self._handle_stop_request(now):
@@ -147,12 +137,13 @@ class Dispatcher:
         mode = "sigterm" if self.terminated else self.state.stop_requested()
         if mode is None:
             return True
-        # Logged first: on shutdown, systemd may SIGKILL us while the jobs are being stopped.
-        self.state.record_event(now, "dispatcher-stop", detail=mode)
-        if mode != "graceful":
-            self._stop_all(now)
-        self.draining = True
-        self.state.clear_stop()
+        with self._critical():
+            # Logged first: on shutdown, systemd may SIGKILL us while the jobs are being stopped.
+            self.state.record_event(now, "dispatcher-stop", detail=mode)
+            if mode != "graceful":
+                self._stop_all(now)
+            self.draining = True
+            self.state.clear_stop()
         return bool(self.active)
 
     def _stop_all(self, now: datetime) -> None:
@@ -164,15 +155,17 @@ class Dispatcher:
 
     def _watch_all(self, now: datetime, policy: Policy) -> None:
         for run_id, active in list(self.active.items()):
-            outcome = self._poll(now, active)
-            if outcome is None:
-                continue
-            code, timed_out = outcome
-            if self._executor_lost(active, policy, code, timed_out):
-                self._release(active, now, code)
-            else:
-                self._finish(active, now, code, timed_out)
-            del self.active[run_id]
+            with self._critical():
+                outcome = self._poll(now, active)
+                if outcome is None:
+                    continue
+                code, timed_out = outcome
+                lost = self._outage(active, policy, code, timed_out)
+                if lost is None:
+                    self._finish(active, now, code, timed_out)
+                else:
+                    self._release(active, now, code, lost)
+                del self.active[run_id]
 
     def _poll(self, now: datetime, active: Active) -> tuple[int, bool] | None:
         """The exit code and whether the run timed out, or None while it goes on."""
@@ -183,18 +176,21 @@ class Dispatcher:
             code = active.handle.stop(self.deps.host.run)
         return None if code is None else (code, timed_out)
 
-    def _executor_lost(self, active: Active, policy: Policy, code: int, timed_out: bool) -> bool:
-        """Check 9: a non-ok end on a non-workstation host that no longer answers is the host's fault."""
-        host = policy.hosts.get(active.host)
-        if host is None or host.name == WORKSTATION:
-            return False
+    def _outage(self, active: Active, policy: Policy, code: int, timed_out: bool) -> str | None:
+        """Check 9 and D-050 (4): the idle reason of the outage that cut a non-ok end short, or None when the run is charged."""
         if not timed_out and code in active.spec.ok_exit:
-            return False
-        return executor_reason(host, self.deps.http_json) is not None
+            return None
+        host = policy.hosts.get(active.host)
+        if host is not None and host.name != WORKSTATION:
+            if executor_reason(host, self.deps.http_json) is not None:
+                return idle_reason("executor-down")
+        status_url = self.deps.ollama_url + "/pastore/status"
+        down = gateway_outage(self.deps.http_json, status_url, active.started_at)
+        return idle_reason("ollama-down") if down else None
 
-    def _release(self, active: Active, now: datetime, code: int) -> None:
-        """End a run the lost host cut short: stopped, back to pending, no attempt charged."""
-        self._end_run(active, now, "stopped", code, idle_reason("executor-down"))
+    def _release(self, active: Active, now: datetime, code: int, reason: str) -> None:
+        """End a run an outage cut short: stopped, back to pending, no attempt charged."""
+        self._end_run(active, now, "stopped", code, reason)
         self.state.upsert_job(replace(self._job(active.spec, active.model), status="pending"))
 
     def _finish(self, active: Active, now: datetime, code: int, timed_out: bool) -> None:
@@ -203,7 +199,7 @@ class Dispatcher:
         if not timed_out and code in spec.ok_exit:
             self._read(active, now, job, code)
             return
-        detail = "oom" if not timed_out and _oom_killed(self.deps.host.run, active) else ""
+        detail = "oom" if not timed_out and oom_killed(self.deps.host.run, active) else ""
         self._end_run(active, now, "timeout" if timed_out else "failed", code, detail)
         attempts = job.attempts + 1
         status = "failed" if attempts >= MAX_ATTEMPTS else "pending"
@@ -431,32 +427,24 @@ class Dispatcher:
             self.state.record_event(now, "starved", job.ref, detail)
 
     def _start(self, now: datetime, spec: TaskSpec, model: str, host: str) -> bool:
-        run_id, run_dir = fresh_run_dir(self.deps.paths.runs_dir, now)
-        run = RunRow(run_id, spec.ref, model, host, spec.fingerprint, "running", iso(now))
-        self.state.insert_run(run)
-        self.state.upsert_job(replace(self._job(spec, model), status="running"))
-        self.state.record_event(now, "run-start", spec.ref, f"{run_id} {model} {host}")
-        try:
-            handle = self.deps.start(
-                spec, run_dir, run_id, self.deps.ollama_url, model, self.deps.base_env
-            )
-        except OSError as exc:
-            failed = Active(spec, model, host, run_id, run_dir, now, _NoHandle())
-            self._finish(failed, now, 127, False)
-            self.state.record_event(now, "refused", spec.ref, f"{model}: could not start: {exc}")
-            return False
-        self.active[run_id] = Active(spec, model, host, run_id, run_dir, now, handle)
-        return True
-
-
-class _NoHandle:
-    """Stands in for a run whose process never started."""
-
-    def poll(self) -> int | None:
-        return 127
-
-    def stop(self, run: object, wait_s: float = 30.0) -> int:
-        return 127
+        with self._critical():
+            run_id, run_dir = fresh_run_dir(self.deps.paths.runs_dir, now)
+            run = RunRow(run_id, spec.ref, model, host, spec.fingerprint, "running", iso(now))
+            self.state.insert_run(run)
+            self.state.upsert_job(replace(self._job(spec, model), status="running"))
+            self.state.record_event(now, "run-start", spec.ref, f"{run_id} {model} {host}")
+            try:
+                handle = self.deps.start(
+                    spec, run_dir, run_id, self.deps.ollama_url, model, self.deps.base_env
+                )
+            except OSError as exc:
+                failed = Active(spec, model, host, run_id, run_dir, now, NoHandle())
+                self._finish(failed, now, 127, False)
+                detail = f"{model}: could not start: {exc}"
+                self.state.record_event(now, "refused", spec.ref, detail)
+                return False
+            self.active[run_id] = Active(spec, model, host, run_id, run_dir, now, handle)
+            return True
 
 
 def _kv_per_slot(state: HostState, model: str) -> int | None:
@@ -477,23 +465,6 @@ def _hold(loads: list[HostLoad], host: str, model: str) -> None:
     loads[index] = replace(loads[index], held=(*loads[index].held, model))
 
 
-def _oom_killed(run: Runner, active: Active) -> bool:
-    """True when this boot's kernel log holds an OOM kill whose victim sat in the run's own scope."""
-    if isinstance(active.handle, _NoHandle):
-        return False
-    since = int(active.started_at.timestamp())
-    result = run(["journalctl", "-k", "-o", "cat", "--no-pager", f"--since=@{since}"])
-    if result.returncode != 0:
-        return False
-    scope = f"/pastore-{active.run_id}.scope"
-    return any(
-        field.startswith("task_memcg=") and field.endswith(scope)
-        for line in result.stdout.splitlines()
-        if line.startswith("oom-kill:")
-        for field in line.split(",")
-    )
-
-
 def _charge_crash(job: JobRow) -> JobRow:
     streak = job.crash_streak + 1
     attempts = job.attempts + (1 if streak >= 2 else 0)
@@ -508,8 +479,9 @@ def serve(
     clock: Callable[[], datetime],
     sleep: Callable[[float], None],
     tick_s: float = TICK_S,
+    tick_bound_s: float = TICK_BOUND_S,
 ) -> int:
-    """Hold the lock, recover, and tick until a stop request; the only loop in pastore."""
+    """Hold the lock, recover, and tick until a stop request, each tick bounded by a SIGALRM timer; the only loop in pastore."""
     with DispatcherLock(deps.paths.lock), closing(open_state(deps.paths)) as state:
 
         def log(message: str) -> None:
@@ -522,7 +494,11 @@ def serve(
         def on_sigterm(_signum: int, _frame: FrameType | None) -> None:
             dispatcher.terminated = True  # `_nap` wakes within 1 s; a handler must not touch sqlite
 
+        def on_sigalrm(_signum: int, _frame: FrameType | None) -> None:
+            dispatcher.overrun(tick_bound_s)
+
         previous = signal.signal(signal.SIGTERM, on_sigterm)
+        previous_alarm = signal.signal(signal.SIGALRM, on_sigalrm)
         stale = [state.stop_requested(), state.run_now_requested()]
         state.clear_stop()
         state.clear_run_now()
@@ -532,10 +508,11 @@ def serve(
             clock(), "dispatcher-start", detail=f"dropped stale {dropped}" if dropped else ""
         )
         try:
-            while _guarded_tick(dispatcher, state, clock):
+            while _guarded_tick(dispatcher, state, clock, tick_bound_s):
                 _nap(dispatcher, sleep, tick_s)
         finally:
             signal.signal(signal.SIGTERM, previous)
+            signal.signal(signal.SIGALRM, previous_alarm)
     return 0
 
 
@@ -551,10 +528,13 @@ def _nap(dispatcher: Dispatcher, sleep: Callable[[float], None], tick_s: float) 
         sleep(1.0)
 
 
-def _guarded_tick(dispatcher: Dispatcher, state: State, clock: Callable[[], datetime]) -> bool:
-    """One tick; an unexpected error is logged as a tick-error event and the loop goes on."""
+def _guarded_tick(
+    dispatcher: Dispatcher, state: State, clock: Callable[[], datetime], tick_bound_s: float = 0.0
+) -> bool:
+    """One tick under a one-shot SIGALRM timer (0 arms none); an error or a TickOverrun is logged as a tick-error event and the loop goes on."""
     try:
-        return dispatcher.tick(clock())
+        with bounded(tick_bound_s):
+            return dispatcher.tick(clock())
     except Exception as exc:  # noqa: BLE001 — the night must not end on one bad tick; the error is recorded
         message = f"{type(exc).__name__}: {exc}"
         print(f"tick-error: {message}", file=sys.stderr)
