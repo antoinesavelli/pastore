@@ -226,12 +226,26 @@ def test_the_retired_key_is_refused_as_unknown_and_vram_gib_as_missing() -> None
     assert "host 'executor': missing key 'vram_gib'" in message
 
 
-@pytest.mark.parametrize("vram", [21.5, 5.6, 24.0, 0.1, 15.999999999999998])
+@pytest.mark.parametrize(
+    "vram",
+    [
+        21.5,
+        5.6,
+        24.0,
+        0.1,
+        15.999999999999998,
+        1e-05,
+        1.5e-07,
+        2e-300,
+        1e16,
+        1.2e22,
+        1.7976931348623157e308,
+    ],
+)
 def test_render_round_trips_a_fractional_vram_gib_exactly(vram: float) -> None:
     host = Host("workstation", "http://127.0.0.1:11435", vram, 1, 1, 32768)
     policy = replace(rich_policy(), hosts={"workstation": host})
     text = render_policy(policy)
-    assert f"vram_gib: {vram!r}," in text
     assert parse_policy(text).hosts["workstation"].vram_gib == vram
     assert render_policy(parse_policy(text)) == text
 

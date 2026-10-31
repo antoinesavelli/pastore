@@ -422,9 +422,15 @@ def _strings(values: tuple[str, ...]) -> str:
     return "[" + ", ".join(_quote(v) for v in values) + "]"
 
 
+def _yaml_float(value: float) -> str:
+    """`repr` of the float, with `.0` before a dotless exponent (`1e-05` -> `1.0e-05`): YAML 1.1 reads `1e-05` as a string."""
+    text = repr(float(value))
+    return text.replace("e", ".0e") if "e" in text and "." not in text else text
+
+
 def _host_line(host: Host) -> str:
     fields = (
-        f"url: {_quote(host.url)}, vram_gib: {host.vram_gib!r}, max_models: {host.max_models},"
+        f"url: {_quote(host.url)}, vram_gib: {_yaml_float(host.vram_gib)}, max_models: {host.max_models},"
         f" parallel: {host.parallel}, context: {host.context}"
     )
     return f"  {_key(host.name)}: {{{fields}}}"

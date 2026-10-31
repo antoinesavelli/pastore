@@ -1,7 +1,9 @@
 """Placement tests: R25 sizing with D-041 KV cache, check 8, host preference, free VRAM, loaded and missing-KV rules.
 
-Depends on: pastore.placement and pastore.spec (Host); plain values, no fakes.
+Depends on: pastore.placement, pastore.spec (Host) and pytest only; plain values, no fakes.
 """
+
+import pytest
 
 from pastore.placement import (
     GIB,
@@ -242,9 +244,12 @@ def test_a_model_fits_when_the_need_equals_free_vram_and_not_one_byte_less() -> 
     assert place(MODEL, [tight]) is None
 
 
-def test_a_fractional_card_is_floored_to_whole_bytes_and_the_boundary_is_exact() -> None:
-    card = int(5.6 * GIB)
-    ex = host("executor", 5.6)
+@pytest.mark.parametrize(("gib", "card"), [(5.6, 6_012_954_214), (5.7, 6_120_328_396)])
+def test_a_fractional_card_is_floored_to_whole_bytes_and_the_boundary_is_exact(
+    gib: float, card: int
+) -> None:
+    """5.6 GiB is 6012954214.4 bytes and 5.7 GiB is 6120328396.8: floor, not round, gives the figures above."""
+    ex = host("executor", gib)
     assert free_bytes(load(ex)) == card
 
     def on_card(need: int) -> HostLoad:
