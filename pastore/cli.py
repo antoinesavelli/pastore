@@ -116,13 +116,28 @@ def _dispatcher_up(ctx: Ctx) -> bool:
     return beat is not None and ctx.clock() - beat <= HEARTBEAT_STALE
 
 
+def _sha256_of(path: Path) -> str:
+    """The sha256 hex digest of a file's bytes; OSError when it cannot be opened or read."""
+    with path.open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+def _evidence_changed(pair: Pair) -> bool:
+    """True when the evidence is not a readable regular file or its sha256 is not the recorded one (D-050 (8))."""
+    try:
+        return not pair.evidence.is_file() or _sha256_of(pair.evidence) != pair.sha256
+    except OSError:
+        return True
+
+
 def _pair_line(state: State, pair: Pair) -> str:
-    """One status line for a listed pair: job status, attempts, last run and its host, starved flag."""
+    """One status line for a listed pair: job status, attempts, last run and its host, starved and evidence-changed flags."""
     job, run = state.get_job(pair.task, pair.model), state.last_run(pair.task, pair.model)
     line = f"{pair.task} {pair.model}: {job.status if job else 'unseen'}"
     line += f" attempts={job.attempts if job else 0}"
     line += f" last_run={run.status} host={run.host}" if run else " last_run=none"
-    return line + (" starved" if job and job.starved_flagged else "")
+    line += " starved" if job and job.starved_flagged else ""
+    return line + (" evidence-changed" if _evidence_changed(pair) else "")
 
 
 def _run_lines(state: State) -> list[str]:
@@ -312,9 +327,7 @@ def _add(ctx: Ctx, args: argparse.Namespace) -> int:
             f"{args.ref}: no passing contract test for its current manifest entry; "
             f"run: pastore check --contract {args.ref}"
         )
-    with evidence.open("rb") as handle:
-        digest = hashlib.file_digest(handle, "sha256").hexdigest()
-    pair = Pair(args.ref, args.model, evidence, digest)
+    pair = Pair(args.ref, args.model, evidence, _sha256_of(evidence))
     return _confirm_and_write(ctx, with_job_added(policy, pair), args.yes)
 
 

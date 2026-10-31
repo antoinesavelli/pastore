@@ -1,6 +1,6 @@
 """Pins the CLI surface: the add gate (model, evidence, contract), remove, status (state lines and the gateway read), stop, check, rerun/ack/reset, run-now and contract gates, start wiring.
 
-Depends on: pastore.cli, pastore.dispatcher (Deps), pastore.hosts (HttpJson), pastore.policy, pastore.spec (Pair), pastore.state, pastore.manifest, tests.fakes; the gateway is always an injected HttpJson, never 127.0.0.1:11434.
+Depends on: pastore.cli, pastore.dispatcher (Deps), pastore.hosts (HttpJson), pastore.policy, pastore.spec (Pair), pastore.state, pastore.manifest, tests.fakes, tests.test_dispatcher (Rig, for the one dispatcher tick); the gateway is always an injected HttpJson, never 127.0.0.1:11434.
 """
 
 import hashlib
@@ -10,7 +10,7 @@ import os
 import stat
 import sys
 import urllib.error
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from email.message import Message
 from pathlib import Path
@@ -25,12 +25,14 @@ from pastore.policy import load_policy
 from pastore.spec import Pair
 from pastore.state import DispatcherLock, JobRow, RunRow, default_paths, open_state
 from tests.fakes import FakeClock
+from tests.test_dispatcher import Rig
+from tests.test_dispatcher import task as dispatcher_task
 
 T0 = datetime(2026, 10, 25, 3, 0, tzinfo=UTC)
 MODEL = "qwen3:8b"
 OTHER = "gemma3:4b"
 EVIDENCE = b"qwen3:8b passes bench on the owner's holdout\n"
-FAKE_SHA = "0" * 64
+SHA = hashlib.sha256(EVIDENCE).hexdigest()
 GATEWAY_URL = "http://127.0.0.1:11434/pastore/status"
 LEVELS = ("reins", "webui", "coding", "corsu", "routine", "hearth")
 REFUSED = "gateway: not answering ([Errno 111] Connection refused)"
@@ -118,10 +120,15 @@ class Env:
         self.clock = FakeClock(T0)
         self.gateway = Gateway(ConnectionRefusedError(111, "Connection refused"))
 
-    def write_policy(self, *listed: tuple[str, str]) -> None:
-        """Write a valid v2 policy listing these (task, model) pairs in order."""
+    def write_policy(
+        self, *listed: tuple[str, str], evidence: Mapping[str, Path] | None = None
+    ) -> None:
+        """Write a valid v2 policy listing these (task, model) pairs in order, each with the sha256 of EVIDENCE.
+
+        A pair's evidence path is the fixture's file unless `evidence` names another for its model.
+        """
         pairs = "".join(
-            f'\n  - {{task: "{t}", model: "{m}", evidence: "{self.evidence}", sha256: "{FAKE_SHA}"}}'
+            f'\n  - {{task: "{t}", model: "{m}", evidence: "{(evidence or {}).get(m, self.evidence)}", sha256: "{SHA}"}}'
             for t, m in listed
         )
         self.policy.write_text(
@@ -348,6 +355,98 @@ def test_status_shows_one_line_per_pair_and_no_window_line(env: Env) -> None:
     assert "torra/bench qwen3:8b: done attempts=2 last_run=none" in lines
     assert "torra/bench gemma3:4b: unseen attempts=0 last_run=none" in lines
     assert sum(line.startswith("torra/bench ") for line in lines) == 2
+
+
+def evidence_status(env: Env) -> list[str]:
+    """Write the pair-line policy (MODEL on the fixture's evidence, OTHER on a copy), create state, return the status lines."""
+    second = env.evidence.with_name("second.md")
+    second.write_bytes(EVIDENCE)
+    env.write_policy(("torra/bench", MODEL), ("torra/bench", OTHER), evidence={OTHER: second})
+    open_state(env.paths).close()
+    return env.run("status")[1].splitlines()
+
+
+def test_status_flags_no_pair_whose_evidence_is_unchanged(env: Env) -> None:
+    lines = evidence_status(env)
+    assert "torra/bench qwen3:8b: unseen attempts=0 last_run=none" in lines
+    assert "evidence-changed" not in "\n".join(lines)
+
+
+def test_status_flags_only_the_pair_whose_evidence_changed_by_one_byte(env: Env) -> None:
+    env.evidence.write_bytes(EVIDENCE[:-1] + b"!")
+    lines = evidence_status(env)
+    assert "torra/bench qwen3:8b: unseen attempts=0 last_run=none evidence-changed" in lines
+    assert "torra/bench gemma3:4b: unseen attempts=0 last_run=none" in lines
+    assert sum("evidence-changed" in line for line in lines) == 1
+
+
+def test_status_puts_evidence_changed_after_starved(env: Env) -> None:
+    env.evidence.write_bytes(b"")
+    state = open_state(env.paths)
+    state.upsert_job(JobRow("torra/bench", MODEL, "fp", "pending", attempts=1, starved_flagged=1))
+    state.close()
+    assert (
+        "torra/bench qwen3:8b: pending attempts=1 last_run=none starved evidence-changed"
+        in evidence_status(env)
+    )
+
+
+def make_directory(path: Path) -> None:
+    path.unlink()
+    path.mkdir()
+
+
+def make_fifo(path: Path) -> None:
+    path.unlink()
+    os.mkfifo(path)
+
+
+@pytest.mark.parametrize(
+    "unreadable",
+    [
+        pytest.param(Path.unlink, id="deleted"),
+        pytest.param(make_directory, id="directory"),
+        pytest.param(make_fifo, id="fifo"),
+        pytest.param(
+            lambda path: path.chmod(0),
+            id="permission-denied",
+            marks=pytest.mark.skipif(os.geteuid() == 0, reason="root reads any file"),
+        ),
+    ],
+)
+def test_status_flags_an_unreadable_evidence_file_and_still_prints_every_other_line(
+    env: Env, unreadable: Callable[[Path], None]
+) -> None:
+    unreadable(env.evidence)
+    assert evidence_status(env) == [
+        "dispatcher: dispatcher-down",
+        "idle: none",
+        "workload watch: not run yet",
+        "torra/bench qwen3:8b: unseen attempts=0 last_run=none evidence-changed",
+        "torra/bench gemma3:4b: unseen attempts=0 last_run=none",
+        REFUSED,
+    ]
+    assert env.run("status")[0] == 0
+
+
+def test_relisting_a_pair_clears_the_evidence_changed_flag(env: Env) -> None:
+    env.pass_contract()
+    assert env.add("--yes")[0] == 0
+    env.evidence.write_bytes(b"pruvera wrote a pass verdict\n")
+    assert "evidence-changed" in env.run("status")[1]
+    assert env.run("remove", "torra/bench", "--model", MODEL, "--yes")[0] == 0
+    assert env.add("--yes")[0] == 0
+    code, out = env.run("status")
+    assert code == 0 and "evidence-changed" not in out
+    assert env.jobs()[0].sha256 == hashlib.sha256(env.evidence.read_bytes()).hexdigest()
+
+
+def test_a_listed_ready_pair_whose_evidence_changed_still_starts(tmp_path: Path) -> None:
+    rig = Rig(tmp_path, [dispatcher_task(tmp_path, "a")], ["c/a"])
+    (rig.root / "evidence.json").write_bytes(b"not the bytes the policy recorded")
+    rig.tick()
+    assert [e.ref for e in rig.events("run-start")] == ["c/a"]
+    assert rig.job_status("a") == "running"
 
 
 def test_status_last_run_is_per_model(env: Env) -> None:
