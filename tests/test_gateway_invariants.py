@@ -3,6 +3,7 @@
 Depends on: tests.test_invariants (the scanners), the source files under pastore/gateway/, and a python subprocess.
 """
 
+import ast
 import subprocess
 import sys
 from pathlib import Path
@@ -31,6 +32,26 @@ PROBE = (
 )
 
 
+def _is_dispatcher_only(module: str) -> bool:
+    return any(module == m or module.startswith(m + ".") for m in DISPATCHER_ONLY)
+
+
+def forbidden_imports(name: str, text: str, package: str = "pastore.gateway") -> list[str]:
+    """Import and ImportFrom nodes anywhere in the source, function bodies included, naming a dispatcher-only module."""
+    found = []
+    for node in ast.walk(ast.parse(text)):
+        if isinstance(node, ast.Import):
+            targets = [a.name for a in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            parts = package.split(".")[: len(package.split(".")) - max(node.level - 1, 0)]
+            base = ".".join((parts if node.level else []) + ([node.module] if node.module else []))
+            targets = [base] + [f"{base}.{a.name}" for a in node.names]
+        else:
+            continue
+        found += [f"{name}:{node.lineno}: {t}" for t in targets if _is_dispatcher_only(t)]
+    return found
+
+
 def _sources() -> list[Path]:
     files = sorted(GATEWAY.glob("*.py"))
     assert files, "no gateway sources found"
@@ -54,7 +75,20 @@ def test_invariant_no_real_clock_in_gateway_decision_code() -> None:
 
 
 def test_invariant_gateway_imports_no_dispatcher_write_path() -> None:
-    """Importing the gateway entry point and server loads none of the dispatcher-only modules (R20)."""
+    """The gateway neither imports (even lazily, in a function body) nor loads at import time a dispatcher-only module (R20)."""
+    assert forbidden_imports("x.py", "def f():\n    import pastore.runner\n")
+    assert forbidden_imports("x.py", "def f():\n    from pastore import cli\n")
+    assert forbidden_imports("x.py", "from pastore.dispatcher import run_one")
+    assert forbidden_imports("x.py", "import pastore.hosts as h")
+    assert forbidden_imports("x.py", "def f():\n    from .. import placement\n")
+    assert forbidden_imports("x.py", "from ..workload_watch import WorkloadWatch")
+    assert not forbidden_imports(
+        "x.py",
+        "import pastore.policy\nfrom pastore import spec\nfrom pastore.state import default_paths\n"
+        "from . import queue\nfrom .queue import Queue\nfrom pastore.gateway.server import make_app\n"
+        "import pastore.clients\n",
+    )
+    assert [v for p in _sources() for v in forbidden_imports(p.name, p.read_text())] == []
     probe = subprocess.run(
         [sys.executable, "-c", PROBE],
         cwd=ROOT,

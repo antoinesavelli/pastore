@@ -4,6 +4,7 @@ Depends on: the source files under pastore/ (scanned as AST), plus pastore.spec.
 """
 
 import ast
+import re
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,7 @@ CLOCK_CALLS = {
     ("date", "today"),
 }
 CLOCK_ALLOWED = {"cli.py"}
+SSH_COMMAND = re.compile(r"^(\S*/)?ssh(\s|$)")
 
 
 def _sources() -> list[Path]:
@@ -60,7 +62,7 @@ def _docstring_ids(tree: ast.Module) -> set[int]:
 
 
 def ssh_violations(name: str, text: str) -> list[str]:
-    """String constants naming the ssh binary: "ssh", "<path>/ssh" or "ssh <args>" (an argv's first element too).
+    """String constants starting with the ssh binary, bare or path-qualified, alone or as a shell command.
 
     Docstrings are skipped (prose may mention ssh); a lookalike such as "sshd_config" is not the binary.
     """
@@ -72,7 +74,7 @@ def ssh_violations(name: str, text: str) -> list[str]:
         if isinstance(node, ast.Constant)
         and isinstance(node.value, str)
         and id(node) not in docstrings
-        and (node.value == "ssh" or node.value.endswith("/ssh") or node.value.startswith("ssh "))
+        and SSH_COMMAND.match(node.value)
     ]
 
 
@@ -111,10 +113,15 @@ def test_scanners_catch_violations() -> None:
     assert ssh_violations("x.py", 'run(("ssh", "second-host", "true"))')
     assert ssh_violations("x.py", 'run(["/usr/bin/ssh", "-L", "1:2:3", "h"])')
     assert ssh_violations("x.py", 'run(["sh", "-c", "ssh second-host true"])')
+    assert ssh_violations("x.py", 'run(["sh", "-c", "/usr/bin/ssh second-host true"])')
+    assert ssh_violations("x.py", 'cmd = f"/usr/local/bin/ssh {host} true"')
+    assert ssh_violations("x.py", 'cmd = "./ssh -L 1:2:3 host"')
     assert ssh_violations("x.py", 'cmd = f"ssh {host} true"')
     assert ssh_violations("x.py", 'shutil.which("ssh")')
     assert not ssh_violations("x.py", 'path = "/etc/ssh/sshd_config"\nunit = "sshd.service"')
     assert not ssh_violations("x.py", 'run(["sshpass", "-V"])')
+    assert not ssh_violations("x.py", 'p = "/etc/ssh/sshd_config"\nq = "/etc/ssh/ssh_config"')
+    assert not ssh_violations("x.py", 'm = "the ssh forward is a user unit"')
     assert not ssh_violations(
         "x.py",
         '"""ssh forward notes."""\n\n\nclass C:\n    """ssh is run by the user unit."""\n\n'
