@@ -1,4 +1,4 @@
-"""The fleet dispatcher: each tick heartbeats, honours stop and run-now requests, watches every running job, places the ready ones, and records any foreign workload disruption that overlaps an executor run (R35); a tick is bounded at 60 s (D-050 (6)).
+"""The fleet dispatcher: each tick heartbeats, honours stop and run-now requests, watches every running job, places the ready ones, and records any watched-workload disruption that overlaps an executor run (R35); a tick is bounded at 60 s (D-050 (6)).
 
 Depends on: policy (PolicyCache), manifest, state (State, rows, lock), checks (Host), hosts (read_host), placement (place), runner, run_end (Active, NoHandle, charge_crash, charge_failure, oom_killed, outage_reason, poll_run), tick_bound, contract (Started), spec, workload_watch.
 """
@@ -36,6 +36,7 @@ from pastore.spec import (
     RUN_DIR_ENV,
     RunReader,
     TaskSpec,
+    WatchConfig,
     canonical_model,
     idle_reason,
 )
@@ -115,12 +116,15 @@ class Dispatcher(CriticalSections):
                 return False
         else:
             self._dispatch(now, policy)
-        self._watch_workload(now)
+        self._watch_workload(now, policy.watch)
         self._prune(now)
         return True
 
-    def _watch_workload(self, now: datetime) -> None:
-        """R35: read the workload's journal against the executor runs and record a new overlap; it never acts on a run."""
+    def _watch_workload(self, now: datetime, config: WatchConfig | None) -> None:
+        """R35: read a foreign workload's journal against the executor runs and record a new overlap; it never acts on a run."""
+        if config is None:
+            self.state.set_workload_watch("off")
+            return
         spans = [
             workload_watch.Span(
                 row.run_id,
@@ -130,7 +134,8 @@ class Dispatcher(CriticalSections):
             )
             for row in self.state.executor_runs(now - workload_watch.KEEP_AFTER_END)
         ]
-        found = workload_watch.watch(now, spans, workload_watch.journal_reader(self.deps.host.run))
+        reader = workload_watch.journal_reader(self.deps.host.run)
+        found = workload_watch.watch(config, now, spans, reader)
         self.state.set_workload_watch(found.status)
         for overlap in found.overlaps:
             if not self.state.has_event("workload-overlap", overlap.key()):
@@ -540,11 +545,11 @@ def _guarded_tick(
     try:
         with bounded(tick_bound_s):
             return dispatcher.tick(clock())
-    except Exception as exc:  # noqa: BLE001 — the night must not end on one bad tick; the error is recorded
+    except Exception as exc:  # noqa: BLE001 - the night must not end on one bad tick; the error is recorded
         message = f"{type(exc).__name__}: {exc}"
         print(f"tick-error: {message}", file=sys.stderr)
         try:
             state.record_event(clock(), "tick-error", detail=message)
-        except Exception as inner:  # noqa: BLE001 — state itself failing must still not kill the loop
+        except Exception as inner:  # noqa: BLE001 - state itself failing must still not kill the loop
             print(f"tick-error not recorded: {inner}", file=sys.stderr)
         return True

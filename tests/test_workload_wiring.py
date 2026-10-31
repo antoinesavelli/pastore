@@ -1,10 +1,11 @@
-"""R35 wiring and check 15 end to end: the tick records foreign workload overlaps, `pastore status` shows them, `pastore ack-workload` clears them.
+"""R35 wiring and check 15 end to end: the tick records foreign-workload overlaps, `pastore status` shows them, `pastore ack-workload` clears them.
 
-Depends on: pastore.dispatcher, pastore.cli and pastore.state over the fleet Rig of tests/test_dispatcher.py; a scripted journalctl on the host run seam (no real journalctl, systemd, ssh or Ollama).
+Depends on: pastore.dispatcher, pastore.cli, pastore.policy and pastore.state over the fleet Rig of tests/test_dispatcher.py; a scripted journalctl on the host run seam (no real journalctl, systemd, ssh or Ollama).
 """
 
 import io
 import json
+import sqlite3
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -15,11 +16,10 @@ import pytest
 
 from pastore.cli import main
 from pastore.dispatcher import Dispatcher, _guarded_tick
-from pastore.policy import PolicyCache
+from pastore.policy import PolicyCache, load_policy
 from pastore.runner import Runner
 from pastore.spec import WORKSTATION
 from pastore.state import RunRow, StateError, default_paths, open_state
-from pastore.workload_watch import WORKLOAD_UNIT, REACHABILITY_UNIT, UNITS
 from tests.fakes import RecordingRunner
 from tests.test_dispatcher import (
     EXECUTOR,
@@ -33,22 +33,27 @@ from tests.test_dispatcher import (
     host,
     net_of,
 )
+from tests.test_workload_watch import CONFIG, HEALTH_UNIT, WORKLOAD_UNIT
 
-UP = "health=ok 12ms"
-DOWN = (
-    "health=down since 11:58, "
-    "connection refused"
-)
-LOST = (
-    "[LINK ALARM] link DOWN for 312s during an active window. "
-    "Work is NOT being processed (paused). Check the other node."
-)
+UNITS = CONFIG.units
+WATCH = f"""watch:
+  status: health
+  signals:
+    - {{name: health, unit: "{HEALTH_UNIT}", good: '^ok\\b', bad: '^down\\b'}}
+    - {{name: link, unit: "{WORKLOAD_UNIT}", good: 'link restored', bad: 'link lost', first_bad: true}}
+    - {{name: lag, unit: "{WORKLOAD_UNIT}", value: 'lag (\\d+)s', limit: 900}}
+"""
+
+RETIRED = "legacy"
+UP = "ok 12ms"
+DOWN = "down since 11:58, connection refused"
+LOST = "link lost for 312s"
 EVIL = "\x1b[31mEVIL\x1b]0;pwned\x07"
 RUN_A = "20261024T020000-1"
-KEY = f"{RUN_A} reachability 2026-10-24T02:03:00Z"
+KEY = f"{RUN_A} health 2026-10-24T02:03:00Z"
 DETAIL = (
     f"run={RUN_A} c/a run=2026-10-24T02:00:00Z..running "
-    "signal=reachability disruption=2026-10-24T02:03:00Z..ongoing"
+    "signal=health disruption=2026-10-24T02:03:00Z..ongoing"
 )
 WARNING = f"<4>pastore: workload-overlap {DETAIL}\n"
 
@@ -97,7 +102,7 @@ class Journal:
 class Wired:
     """A fleet Rig whose host answers journalctl from recorded lines; c/a runs on the executor and keeps running."""
 
-    def __init__(self, tmp_path: Path, *, fleet: bool = True) -> None:
+    def __init__(self, tmp_path: Path, *, fleet: bool = True, watch: bool = True) -> None:
         base = host()
         assert isinstance(base.run, RecordingRunner)
         self.recorder = base.run
@@ -108,6 +113,7 @@ class Wired:
             ["c/a"],
             ids=("a", "b"),
             hosts=FLEET if fleet else WORKSTATION_ONLY,
+            watch=WATCH if watch else "",
             host=replace(base, run=self.journal),
         )
         self.rig.next_codes = [None]
@@ -148,10 +154,10 @@ def refuse_gateway(url: str, body: Mapping[str, object] | None, timeout_s: float
 
 
 def overlap_scenario(tmp_path: Path, *, down: bool) -> Wired:
-    """c/a on the executor, c/b joining on the workstation mid-way; the workload goes down at +3 min when `down`."""
+    """c/a on the executor, c/b joining on the workstation mid-way; the health signal goes down at +3 min when `down`."""
     w = Wired(tmp_path)
-    w.journal.add(REACHABILITY_UNIT, 1, UP)
-    w.journal.add(REACHABILITY_UNIT, 3, DOWN if down else UP)
+    w.journal.add(HEALTH_UNIT, 1, UP)
+    w.journal.add(HEALTH_UNIT, 3, DOWN if down else UP)
     w.tick_at(0)
     w.tick_at(2)
     w.rig.list_jobs(["c/a", "c/b"])
@@ -168,8 +174,8 @@ def test_check_15_an_overlap_records_one_event_over_many_ticks_and_warns_on_stde
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     w = Wired(tmp_path)
-    w.journal.add(REACHABILITY_UNIT, 1, UP)
-    w.journal.add(REACHABILITY_UNIT, 3, DOWN)
+    w.journal.add(HEALTH_UNIT, 1, UP)
+    w.journal.add(HEALTH_UNIT, 3, DOWN)
     w.tick_at(0)
     w.tick_at(2)
     assert w.rig.events("workload-overlap") == [] and capsys.readouterr().err == ""
@@ -223,7 +229,9 @@ def outcome_of(w: Wired) -> Outcome:
 def test_check_15_an_overlap_never_stops_a_run_or_changes_work(tmp_path: Path) -> None:
     hit = overlap_scenario(tmp_path / "hit", down=True)
     clean = overlap_scenario(tmp_path / "clean", down=False)
-    assert len(hit.rig.events("workload-overlap")) == 1 and clean.rig.events("workload-overlap") == []
+    assert (
+        len(hit.rig.events("workload-overlap")) == 1 and clean.rig.events("workload-overlap") == []
+    )
     got = outcome_of(hit)
     assert got == outcome_of(clean)
     kinds = [kind for kind, _, _ in got.events]
@@ -243,12 +251,12 @@ def test_check_15_no_overlap_records_nothing_and_the_watch_is_armed(
     assert w.rig.state.workload_watch() == "armed" and capsys.readouterr().err == ""
 
 
-def test_check_15_workload_down_the_whole_window_reads_workload_down_with_no_overlap(
+def test_check_15_down_the_whole_window_reads_down_with_no_overlap(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     w = Wired(tmp_path)
     for minutes in (-20, -10, 1, 3):
-        w.journal.add(REACHABILITY_UNIT, minutes, DOWN)
+        w.journal.add(HEALTH_UNIT, minutes, DOWN)
     w.tick_at(0)
     w.tick_at(4)
     assert w.rig.state.runs_with_status("running")[0].host == EXECUTOR
@@ -283,7 +291,7 @@ def test_check_15_an_unreadable_journal_is_stored_as_unreadable_and_work_goes_on
     assert rig.events("tick-error") == [] and rig.events("workload-overlap") == []
     assert len(rig.handles) == 1 and [e.kind for e in rig.events("run-start")] == ["run-start"]
     w.journal.rc, w.journal.raw = 0, None
-    w.journal.add(REACHABILITY_UNIT, 0.5, UP)
+    w.journal.add(HEALTH_UNIT, 0.5, UP)
     w.tick_at(1)
     assert rig.state.workload_watch() == "armed"
 
@@ -292,8 +300,8 @@ def test_check_15_a_run_on_the_workstation_is_never_a_span(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     w = Wired(tmp_path, fleet=False)
-    w.journal.add(REACHABILITY_UNIT, 1, UP)
-    w.journal.add(REACHABILITY_UNIT, 3, DOWN)
+    w.journal.add(HEALTH_UNIT, 1, UP)
+    w.journal.add(HEALTH_UNIT, 3, DOWN)
     w.tick_at(0)
     w.tick_at(20)
     [run] = w.rig.state.runs_with_status("running")
@@ -313,7 +321,7 @@ def test_check_15_the_watch_runs_after_placement_and_on_draining_ticks_only_whil
     w.journal.on_read = lambda: started_at_read.append(len(w.rig.handles))
     w.tick_at(0)
     assert started_at_read == [1, 1]
-    assert [read[2] for read in w.journal.reads] == [REACHABILITY_UNIT, WORKLOAD_UNIT]
+    assert [read[2] for read in w.journal.reads] == [HEALTH_UNIT, WORKLOAD_UNIT]
     w.rig.state.request_stop("graceful")
     assert w.tick_at(1) is True
     assert len(w.journal.reads) == 4
@@ -332,22 +340,22 @@ def test_check_15_a_finished_run_counts_for_ten_minutes_and_is_checked_for_thirt
     tmp_path: Path, down_at: float, seen_at: float, recorded: int
 ) -> None:
     w = Wired(tmp_path)
-    w.journal.add(REACHABILITY_UNIT, 1, UP)
+    w.journal.add(HEALTH_UNIT, 1, UP)
     w.tick_at(0)
     w.rig.handles[0].codes = [0]
     w.tick_at(5)
     assert [r.run_id for r in w.rig.state.runs_with_status("done")] == [RUN_A]
-    w.journal.add(REACHABILITY_UNIT, down_at, DOWN)
+    w.journal.add(HEALTH_UNIT, down_at, DOWN)
     w.tick_at(seen_at)
     assert len(w.rig.events("workload-overlap")) == recorded
     if recorded:
         start = at(down_at).strftime("%Y-%m-%dT%H:%M:%SZ")
         assert w.overlap_events()[0].endswith(
-            f"run=2026-10-24T02:00:00Z..2026-10-24T02:05:00Z signal=reachability disruption={start}..ongoing"
+            f"run=2026-10-24T02:00:00Z..2026-10-24T02:05:00Z signal=health disruption={start}..ongoing"
         )
 
 
-def test_check_15_a_link_alarm_from_the_workload_is_an_overlap_too(tmp_path: Path) -> None:
+def test_check_15_a_link_alarm_from_the_second_unit_is_an_overlap_too(tmp_path: Path) -> None:
     w = Wired(tmp_path)
     w.journal.add(WORKLOAD_UNIT, 2, LOST)
     w.tick_at(0)
@@ -355,7 +363,7 @@ def test_check_15_a_link_alarm_from_the_workload_is_an_overlap_too(tmp_path: Pat
     [detail] = w.overlap_events()
     assert detail.startswith(f"{RUN_A} link 2026-10-24T02:02:00Z run={RUN_A} c/a ")
     assert "signal=link disruption=2026-10-24T02:02:00Z..ongoing" in detail
-    assert "LOST" not in detail
+    assert "312s" not in detail
 
 
 def test_check_15_executor_runs_are_the_running_and_recently_ended_runs_off_the_workstation(
@@ -459,12 +467,12 @@ def test_check_15_status_shows_the_watch_and_the_overlap_until_ack_workload(
 
 def test_check_15_the_overlap_shows_until_acked_whatever_the_watch_status(tmp_path: Path) -> None:
     w = Wired(tmp_path)
-    w.journal.add(REACHABILITY_UNIT, 1, UP)
-    w.journal.add(REACHABILITY_UNIT, 3, DOWN)
+    w.journal.add(HEALTH_UNIT, 1, UP)
+    w.journal.add(HEALTH_UNIT, 3, DOWN)
     w.tick_at(0)
     w.tick_at(4)
     [event] = w.rig.events("workload-overlap")
-    w.journal.add(REACHABILITY_UNIT, 5, UP)
+    w.journal.add(HEALTH_UNIT, 5, UP)
     w.tick_at(6)
     assert w.rig.state.workload_watch() == "armed" and len(w.rig.events("workload-overlap")) == 1
     assert w.workload_status() == [
@@ -488,14 +496,14 @@ def test_check_15_status_prints_an_overlap_line_as_one_escape_free_line(tmp_path
 
 def test_check_15_an_overlap_after_an_ack_shows_alone(tmp_path: Path) -> None:
     w = Wired(tmp_path)
-    w.journal.add(REACHABILITY_UNIT, 1, UP)
-    w.journal.add(REACHABILITY_UNIT, 3, DOWN)
+    w.journal.add(HEALTH_UNIT, 1, UP)
+    w.journal.add(HEALTH_UNIT, 3, DOWN)
     w.tick_at(0)
     w.tick_at(4)
     assert w.cli("ack-workload")[1] == "acked 1 workload-overlap event(s)\n"
     assert w.cli("ack-workload")[1] == "acked 0 workload-overlap event(s)\n"
-    w.journal.add(REACHABILITY_UNIT, 5, UP)
-    w.journal.add(REACHABILITY_UNIT, 7, DOWN)
+    w.journal.add(HEALTH_UNIT, 5, UP)
+    w.journal.add(HEALTH_UNIT, 7, DOWN)
     w.tick_at(8)
     shown = w.workload_status()
     assert len(shown) == 3 and shown[0] == "workload watch: down"
@@ -528,9 +536,9 @@ def test_check_15_no_journal_text_reaches_status_stderr_events_or_the_stored_wat
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     w = Wired(tmp_path)
-    w.journal.add(REACHABILITY_UNIT, 1, UP)
-    w.journal.add(REACHABILITY_UNIT, 3, f"health=down {EVIL} since=x :: {EVIL}")
-    w.journal.add(WORKLOAD_UNIT, 3, f"[LINK ALARM] {EVIL}")
+    w.journal.add(HEALTH_UNIT, 1, UP)
+    w.journal.add(HEALTH_UNIT, 3, f"down {EVIL} since=x :: {EVIL}")
+    w.journal.add(WORKLOAD_UNIT, 3, f"link lost {EVIL}")
     w.tick_at(0)
     w.tick_at(4)
     texts = [e.detail for e in w.rig.events("workload-overlap")]
@@ -550,3 +558,72 @@ def test_check_15_status_prints_stored_watch_text_as_one_safe_line(tmp_path: Pat
     [line] = w.workload_status()
     assert line.startswith("workload watch: unreadable: ")
     assert "\x1b" not in line and "\x07" not in line and "\n" not in line
+
+
+def test_check_15_the_wired_policy_carries_the_watch_under_test(tmp_path: Path) -> None:
+    assert load_policy(Wired(tmp_path).rig.policy).watch == CONFIG
+
+
+def test_check_15_with_no_watch_section_the_status_is_off_and_no_journal_is_read(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    w = Wired(tmp_path, watch=False)
+    w.journal.add(HEALTH_UNIT, 1, UP)
+    w.journal.add(HEALTH_UNIT, 3, DOWN)
+    w.tick_at(0)
+    w.tick_at(4)
+    assert load_policy(w.rig.policy).watch is None
+    assert w.rig.state.runs_with_status("running")[0].host == EXECUTOR
+    assert w.rig.state.workload_watch() == "off" and w.journal.reads == []
+    assert w.rig.events("workload-overlap") == [] and capsys.readouterr().err == ""
+    assert w.workload_status() == ["workload watch: off"]
+
+
+def test_check_15_the_watch_follows_the_policy_file_on_and_off(tmp_path: Path) -> None:
+    w = Wired(tmp_path, watch=False)
+    w.journal.add(HEALTH_UNIT, 1, UP)
+    w.tick_at(0)
+    assert w.rig.state.workload_watch() == "off" and w.journal.reads == []
+    w.rig.watch = WATCH
+    w.rig.list_jobs(["c/a"])
+    w.tick_at(2)
+    assert w.rig.state.workload_watch() == "armed" and len(w.journal.reads) == 2
+    w.rig.watch = ""
+    w.rig.list_jobs(["c/a"])
+    w.tick_at(3)
+    assert w.rig.state.workload_watch() == "off" and len(w.journal.reads) == 2
+
+
+def test_check_15_a_state_with_the_retired_rows_still_opens_and_the_watch_works(
+    tmp_path: Path,
+) -> None:
+    w = Wired(tmp_path)
+    old_event = "r0 link 2026-10-23T01:00:00Z run=r0 c/a run=a..b signal=link disruption=a..ongoing"
+    with sqlite3.connect(w.rig.paths.db) as conn:
+        conn.execute(
+            "INSERT INTO events(at, ref, kind, detail) VALUES(?, 'c/a', ?, ?)",
+            (T0.isoformat(), f"{RETIRED}-overlap", old_event),
+        )
+        conn.execute(
+            "INSERT INTO events(at, ref, kind, detail) VALUES(?, NULL, ?, 'cleared 1')",
+            (T0.isoformat(), f"{RETIRED}-ack"),
+        )
+        conn.execute("INSERT INTO meta(key, value) VALUES(?, 'armed')", (f"{RETIRED}_watch",))
+        conn.execute("INSERT INTO meta(key, value) VALUES(?, '0')", (f"{RETIRED}_acked_id",))
+    assert w.workload_status() == ["workload watch: not run yet"]
+    assert w.cli("ack-workload") == (0, "acked 0 workload-overlap event(s)\n")
+    w.journal.add(HEALTH_UNIT, 1, UP)
+    w.journal.add(HEALTH_UNIT, 3, DOWN)
+    w.tick_at(0)
+    w.tick_at(4)
+    [event] = w.rig.events("workload-overlap")
+    assert w.workload_status() == [
+        "workload watch: down",
+        f"workload-overlap: {event.at} {DETAIL}",
+        "run pastore ack-workload once reviewed",
+    ]
+    with sqlite3.connect(w.rig.paths.db) as conn:
+        kept = conn.execute("SELECT COUNT(*) FROM events WHERE kind=?", (f"{RETIRED}-overlap",))
+        assert kept.fetchone() == (1,)
+        meta = conn.execute("SELECT value FROM meta WHERE key=?", (f"{RETIRED}_watch",))
+        assert meta.fetchone() == ("armed",)

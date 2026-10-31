@@ -1,4 +1,4 @@
-"""Shared value types: tasks, hosts, source levels and rules, listed pairs, and the closed idle-reason and event lists.
+"""Shared value types: tasks, hosts, source levels and rules, listed pairs, the watch section, and the closed idle-reason and event lists.
 
 Depends on: nothing in pastore; manifest.py and policy.py build these, every other module only reads them.
 """
@@ -80,6 +80,44 @@ class Pair:
     model: str
     evidence: Path
     sha256: str
+
+
+@dataclass(frozen=True)
+class PatternSignal:
+    """A watched signal read from one unit's log lines: a line matching `bad` (tested first) or `good` is a sample."""
+
+    name: str
+    unit: str
+    good: str
+    bad: str
+    first_bad: bool = False
+
+
+@dataclass(frozen=True)
+class ValueSignal:
+    """A watched signal read from one unit's log lines: the digits of `value`'s one group are good iff at most `limit`."""
+
+    name: str
+    unit: str
+    value: str
+    limit: int
+    first_bad: bool = False
+
+
+Signal = PatternSignal | ValueSignal
+
+
+@dataclass(frozen=True)
+class WatchConfig:
+    """The optional `policy.yaml` `watch:` section: a foreign workload's signals and the one that sets armed or down."""
+
+    status: str
+    signals: tuple[Signal, ...]
+
+    @property
+    def units(self) -> tuple[str, ...]:
+        """The watched units, each once, in the order the signals first name them."""
+        return tuple(dict.fromkeys(signal.unit for signal in self.signals))
 
 
 @dataclass(frozen=True)
