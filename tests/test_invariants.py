@@ -1,4 +1,4 @@
-"""Repo-wide invariant scans over pastore's own source: never sudo, and no real clock outside the CLI.
+"""Repo-wide invariant scans over pastore's own source: never sudo, never ssh, and no real clock outside the CLI.
 
 Depends on: the source files under pastore/ (scanned as AST), plus pastore.spec.idle_reason.
 """
@@ -28,6 +28,13 @@ def _sources() -> list[Path]:
     return files
 
 
+def _all_sources() -> list[Path]:
+    """Every module under pastore/, subpackages (the gateway) included."""
+    files = sorted(PACKAGE.rglob("*.py"))
+    assert any("gateway" in p.parts for p in files), "no pastore/gateway sources found"
+    return files
+
+
 def sudo_violations(name: str, text: str) -> list[str]:
     """Literal sudo/pkexec strings, or a systemctl/systemd-run argv list without --user."""
     found = []
@@ -39,6 +46,34 @@ def sudo_violations(name: str, text: str) -> list[str]:
             if items and items[0] in {"systemctl", "systemd-run"} and "--user" not in items:
                 found.append(f"{name}:{node.lineno}: {items}")
     return found
+
+
+def _docstring_ids(tree: ast.Module) -> set[int]:
+    """Identity of every module, class and function docstring node: prose, never an argv."""
+    ids = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
+            first = node.body[0] if node.body else None
+            if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
+                ids.add(id(first.value))
+    return ids
+
+
+def ssh_violations(name: str, text: str) -> list[str]:
+    """String constants naming the ssh binary: "ssh", "<path>/ssh" or "ssh <args>" (an argv's first element too).
+
+    Docstrings are skipped (prose may mention ssh); a lookalike such as "sshd_config" is not the binary.
+    """
+    tree = ast.parse(text)
+    docstrings = _docstring_ids(tree)
+    return [
+        f"{name}:{node.lineno}: {node.value!r}"
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and id(node) not in docstrings
+        and (node.value == "ssh" or node.value.endswith("/ssh") or node.value.startswith("ssh "))
+    ]
 
 
 def _owner(node: ast.expr) -> str | None:
@@ -72,6 +107,19 @@ def test_scanners_catch_violations() -> None:
     assert clock_violations("x.py", "t = datetime.datetime.now()")
     assert clock_violations("x.py", "from time import monotonic")
     assert sudo_violations("x.py", 'run(("sudo", "ls"))')
+    assert ssh_violations("x.py", 'run(["ssh", "second-host", "true"])')
+    assert ssh_violations("x.py", 'run(("ssh", "second-host", "true"))')
+    assert ssh_violations("x.py", 'run(["/usr/bin/ssh", "-L", "1:2:3", "h"])')
+    assert ssh_violations("x.py", 'run(["sh", "-c", "ssh second-host true"])')
+    assert ssh_violations("x.py", 'cmd = f"ssh {host} true"')
+    assert ssh_violations("x.py", 'shutil.which("ssh")')
+    assert not ssh_violations("x.py", 'path = "/etc/ssh/sshd_config"\nunit = "sshd.service"')
+    assert not ssh_violations("x.py", 'run(["sshpass", "-V"])')
+    assert not ssh_violations(
+        "x.py",
+        '"""ssh forward notes."""\n\n\nclass C:\n    """ssh is run by the user unit."""\n\n'
+        '    def f(self) -> None:\n        """ssh local forward, never run here."""\n',
+    )
     assert not clock_violations(
         "x.py", "from datetime import UTC, datetime\nt = datetime(2026, 1, 1)"
     )
@@ -80,6 +128,16 @@ def test_scanners_catch_violations() -> None:
 def test_invariant_never_sudo() -> None:
     """No pastore source builds a sudo/pkexec or system-manager systemd command."""
     found = [v for p in _sources() for v in sudo_violations(p.name, p.read_text())]
+    assert found == []
+
+
+def test_invariant_never_ssh() -> None:
+    """No module under pastore/ (the gateway included) builds an ssh command; the user unit owns the executor link."""
+    found = [
+        v
+        for p in _all_sources()
+        for v in ssh_violations(str(p.relative_to(PACKAGE)), p.read_text())
+    ]
     assert found == []
 
 
