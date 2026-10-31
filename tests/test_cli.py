@@ -127,7 +127,7 @@ class Env:
         self.policy.write_text(
             "version: 2\n"
             "hosts:\n"
-            '  workstation: {url: "http://127.0.0.1:11435", vram_gb: 24, max_models: 3, parallel: 3, context: 32768}\n'
+            '  workstation: {url: "http://127.0.0.1:11435", vram_gib: 24, max_models: 3, parallel: 3, context: 32768}\n'
             "sources:\n"
             '  - {level: hearth, cgroup: ["pastore-*.scope"]}\n'
             f"consumers:\n  torra: {self.manifest}\n"

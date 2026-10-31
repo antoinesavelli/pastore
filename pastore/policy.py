@@ -36,6 +36,7 @@ HEADER = (
     "# `pastore check --contract <consumer>/<id>` (docs/DESIGN-v5.md R29).\n"
     "# Each host's context is its Ollama's default context length in tokens;"
     " placement counts KV cache per slot at it (D-041).\n"
+    "# Each host's vram_gib is the usable VRAM its Ollama reports, in GiB (D-050).\n"
 )
 
 
@@ -87,6 +88,16 @@ def _positive(value: object) -> int:
     return value
 
 
+def _positive_number(value: object) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int | float)
+        or not 0 < value <= sys.float_info.max
+    ):
+        raise ValueError(f"must be a positive number, got {value!r}")
+    return float(value)
+
+
 def _host_ok(host: str) -> bool:
     try:
         if host.startswith("["):
@@ -115,7 +126,7 @@ def _parse_host(name: object, body: object, problems: list[str]) -> Host | None:
         return None
     shape = {
         "url": _normalize_url,
-        "vram_gb": _positive,
+        "vram_gib": _positive_number,
         "max_models": _positive,
         "parallel": _positive,
         "context": _positive,
@@ -413,7 +424,7 @@ def _strings(values: tuple[str, ...]) -> str:
 
 def _host_line(host: Host) -> str:
     fields = (
-        f"url: {_quote(host.url)}, vram_gb: {host.vram_gb}, max_models: {host.max_models},"
+        f"url: {_quote(host.url)}, vram_gib: {host.vram_gib!r}, max_models: {host.max_models},"
         f" parallel: {host.parallel}, context: {host.context}"
     )
     return f"  {_key(host.name)}: {{{fields}}}"

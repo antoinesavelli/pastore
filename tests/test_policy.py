@@ -33,14 +33,14 @@ GOOD_DATA: dict[str, Any] = {
     "hosts": {
         "workstation": {
             "url": "http://127.0.0.1:11435",
-            "vram_gb": 24,
+            "vram_gib": 24,
             "max_models": 3,
             "parallel": 3,
             "context": 32768,
         },
         "executor": {
             "url": "http://192.0.2.101:11434",
-            "vram_gb": 10,
+            "vram_gib": 10,
             "max_models": 3,
             "parallel": 3,
             "context": 8192,
@@ -151,8 +151,8 @@ def test_two_models_of_one_task_are_two_pairs() -> None:
 def test_repo_policy_loads_and_round_trips_byte_for_byte() -> None:
     policy = load_policy(REPO_POLICY)
     assert policy.hosts == {
-        "workstation": Host("workstation", "http://127.0.0.1:11435", 24, 1, 1, 32768),
-        "executor": Host("executor", "http://127.0.0.1:11436", 10, 3, 3, 8192),
+        "workstation": Host("workstation", "http://127.0.0.1:11435", 21.5, 1, 1, 32768),
+        "executor": Host("executor", "http://127.0.0.1:11436", 5.6, 3, 3, 8192),
     }
     assert policy.sources == (
         SourceRule(Level.HEARTH, "cgroup", ("pastore-*.scope",)),
@@ -171,9 +171,9 @@ def test_repo_policy_loads_and_round_trips_byte_for_byte() -> None:
 
 def rich_policy() -> Policy:
     hosts = {
-        "workstation": Host("workstation", "http://127.0.0.1:11435", 24, 3, 3, 32768),
-        "executor": Host("executor", "http://192.0.2.101:11434", 10, 3, 3, 8192),
-        "off": Host("off", "http://[::1]:11437", 16, 1, 4, 16384),
+        "workstation": Host("workstation", "http://127.0.0.1:11435", 24.0, 3, 3, 32768),
+        "executor": Host("executor", "http://192.0.2.101:11434", 10.0, 3, 3, 8192),
+        "off": Host("off", "http://[::1]:11437", 16.0, 1, 4, 16384),
     }
     sources = (
         SourceRule(Level.HEARTH, "cgroup", ("pastore-*.scope",)),
@@ -209,6 +209,33 @@ def test_render_round_trips(variant: str) -> None:
     assert render_policy(parse_policy(text)) == text
 
 
+@pytest.mark.parametrize(("given", "stored"), [(21.5, 21.5), (5.6, 5.6), (24, 24.0), (24.0, 24.0)])
+def test_vram_gib_takes_an_int_or_a_float_and_stores_a_float(given: float, stored: float) -> None:
+    got = parse_policy(mutated(("hosts", "executor", "vram_gib"), given)).hosts["executor"].vram_gib
+    assert got == stored and type(got) is float
+
+
+def test_the_retired_key_is_refused_as_unknown_and_vram_gib_as_missing() -> None:
+    retired = "vram_" + "gb"  # spelled in two parts so a grep for the old name finds no live use
+    data = copy.deepcopy(GOOD_DATA)
+    data["hosts"]["executor"][retired] = data["hosts"]["executor"].pop("vram_gib")
+    with pytest.raises(PolicyError) as info:
+        parse_policy(yaml.safe_dump(data, sort_keys=False))
+    message = str(info.value)
+    assert f"host 'executor': unknown key '{retired}'" in message
+    assert "host 'executor': missing key 'vram_gib'" in message
+
+
+@pytest.mark.parametrize("vram", [21.5, 5.6, 24.0, 0.1, 15.999999999999998])
+def test_render_round_trips_a_fractional_vram_gib_exactly(vram: float) -> None:
+    host = Host("workstation", "http://127.0.0.1:11435", vram, 1, 1, 32768)
+    policy = replace(rich_policy(), hosts={"workstation": host})
+    text = render_policy(policy)
+    assert f"vram_gib: {vram!r}," in text
+    assert parse_policy(text).hosts["workstation"].vram_gib == vram
+    assert render_policy(parse_policy(text)) == text
+
+
 def test_render_writes_context_after_parallel_and_keeps_it() -> None:
     policy = rich_policy()
     text = render_policy(policy)
@@ -224,14 +251,14 @@ def test_missing_context_is_reported_with_every_other_host_problem() -> None:
     data = copy.deepcopy(GOOD_DATA)
     del data["hosts"]["workstation"]["context"]
     data["hosts"]["workstation"]["parallel"] = 0
-    data["hosts"]["executor"]["vram_gb"] = 0
+    data["hosts"]["executor"]["vram_gib"] = 0
     with pytest.raises(PolicyError) as info:
         parse_policy(yaml.safe_dump(data, sort_keys=False))
     message = str(info.value)
     for fragment in (
         "host 'workstation': missing key 'context'",
         "host 'workstation': parallel must be a positive int",
-        "host 'executor': vram_gb must be a positive int",
+        "host 'executor': vram_gib must be a positive number, got 0",
     ):
         assert fragment in message
 
@@ -302,9 +329,26 @@ BAD_EDITS: list[tuple[tuple[str | int, ...], object, str]] = [
             LONG_HOST + "a",
         )
     ],
-    (("hosts", "executor", "vram_gb"), 0, "host 'executor': vram_gb must be a positive int"),
-    (("hosts", "executor", "vram_gb"), "10", "host 'executor': vram_gb must be a positive int"),
-    (("hosts", "executor", "vram_gb"), True, "host 'executor': vram_gb must be a positive int"),
+    (
+        ("hosts", "executor", "vram_gib"),
+        0,
+        "host 'executor': vram_gib must be a positive number, got 0",
+    ),
+    (("hosts", "executor", "vram_gib"), -5.6, "vram_gib must be a positive number, got -5.6"),
+    (("hosts", "executor", "vram_gib"), "10", "vram_gib must be a positive number, got '10'"),
+    (("hosts", "executor", "vram_gib"), True, "vram_gib must be a positive number, got True"),
+    (
+        ("hosts", "executor", "vram_gib"),
+        float("nan"),
+        "vram_gib must be a positive number, got nan",
+    ),
+    (
+        ("hosts", "executor", "vram_gib"),
+        float("inf"),
+        "vram_gib must be a positive number, got inf",
+    ),
+    (("hosts", "executor", "vram_gib"), 10**400, "vram_gib must be a positive number, got 1000"),
+    (("hosts", "executor", "vram_gib"), DELETE, "host 'executor': missing key 'vram_gib'"),
     (("hosts", "executor", "max_models"), -1, "host 'executor': max_models must be a positive int"),
     (("hosts", "executor", "parallel"), 1.5, "host 'executor': parallel must be a positive int"),
     (("hosts", "executor", "context"), DELETE, "host 'executor': missing key 'context'"),
@@ -482,13 +526,13 @@ def test_v1_and_malformed_text_is_refused(text: str, fragment: str) -> None:
 def test_error_lists_every_problem() -> None:
     data = copy.deepcopy(GOOD_DATA)
     data["version"] = 1
-    data["hosts"]["executor"]["vram_gb"] = 0
+    data["hosts"]["executor"]["vram_gib"] = 0
     data["sources"][3]["ancestor"] = ["a/b"]
     data["jobs"][0]["task"] = "nope/x"
     with pytest.raises(PolicyError) as info:
         parse_policy(yaml.safe_dump(data, sort_keys=False))
     message = str(info.value)
-    for fragment in ("version must be 2", "vram_gb", "sources[3].ancestor", "nope/x"):
+    for fragment in ("version must be 2", "vram_gib", "sources[3].ancestor", "nope/x"):
         assert fragment in message
 
 

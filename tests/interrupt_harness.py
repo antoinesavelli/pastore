@@ -287,7 +287,7 @@ def prepare(
     policy = tmp_path / "policy.yaml"
     policy.write_text(
         "version: 2\n"
-        f'hosts:\n  workstation: {{url: "{WS_URL}", vram_gb: 24, max_models: 3, parallel: 3,'
+        f'hosts:\n  workstation: {{url: "{WS_URL}", vram_gib: 24, max_models: 3, parallel: 3,'
         " context: 32768}\n"
         'sources:\n  - {level: hearth, cgroup: ["pastore-*.scope"]}\n'
         f"consumers:\n  {CONSUMER}: {manifest}\njobs:\n{listed}"

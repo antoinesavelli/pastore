@@ -55,7 +55,7 @@ ERRORS = [OSError("refused"), TimeoutError("slow"), ValueError("bad json")]
 
 
 def make_host(name: str = "executor", url: str = EXECUTOR_URL) -> Host:
-    return Host(name=name, url=url, vram_gb=24, max_models=3, parallel=1, context=8192)
+    return Host(name=name, url=url, vram_gib=24, max_models=3, parallel=1, context=8192)
 
 
 def workstation(url: str = WS_URL) -> Host:

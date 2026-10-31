@@ -66,7 +66,7 @@ class HostSpec:
     """One `hosts:` entry of the test policy."""
 
     url: str
-    vram_gb: int
+    vram_gib: float
     max_models: int
     parallel: int
     context: int
@@ -228,7 +228,7 @@ class Rig:
             for t, m in self.pairs
         )
         hosts = "".join(
-            f'  {name}: {{url: "{h.url}", vram_gb: {h.vram_gb}, max_models: {h.max_models},'
+            f'  {name}: {{url: "{h.url}", vram_gib: {h.vram_gib}, max_models: {h.max_models},'
             f" parallel: {h.parallel}, context: {h.context}}}\n"
             for name, h in self.hosts.items()
         )

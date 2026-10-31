@@ -18,16 +18,16 @@ from pastore.spec import WORKSTATION, Host
 MODEL = "m:latest"
 OTHER = "other:latest"
 SMALL = 2 * GIB
-# Placement reads the policy field `vram_gb=10` as 10 GiB (10 * 2**30 bytes); base_need(EXACT_10_GIB) is exactly that
+# Placement reads the policy field `vram_gib=10` as 10 GiB (10 * 2**30 bytes, `int(vram_gib * GIB)`); base_need(EXACT_10_GIB) is exactly that
 OVER_10_GIB = 45 * GIB // 6 + 1
 EXACT_10_GIB = 45 * GIB // 6
 
 
-def host(name: str, vram_gb: int, max_models: int = 2, parallel: int = 1) -> Host:
+def host(name: str, vram_gib: float, max_models: int = 2, parallel: int = 1) -> Host:
     return Host(
         name=name,
         url=f"http://{name}:11434",
-        vram_gb=vram_gb,
+        vram_gib=vram_gib,
         max_models=max_models,
         parallel=parallel,
         context=8192,
@@ -240,6 +240,18 @@ def test_a_model_fits_when_the_need_equals_free_vram_and_not_one_byte_less() -> 
     assert place(MODEL, [fits]) == "executor"
     tight = load(EXECUTOR, {MODEL: SMALL, OTHER: GIB}, resident={OTHER: 10 * GIB - need + 1})
     assert place(MODEL, [tight]) is None
+
+
+def test_a_fractional_card_is_floored_to_whole_bytes_and_the_boundary_is_exact() -> None:
+    card = int(5.6 * GIB)
+    ex = host("executor", 5.6)
+    assert free_bytes(load(ex)) == card
+
+    def on_card(need: int) -> HostLoad:
+        return load(ex, models={MODEL: ModelFacts(SMALL, 0, loaded=need)})
+
+    assert place(MODEL, [on_card(card)]) == "executor"
+    assert place(MODEL, [on_card(card + 1)]) is None
 
 
 def test_a_host_at_max_models_is_not_eligible() -> None:

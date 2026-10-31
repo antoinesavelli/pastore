@@ -52,9 +52,14 @@ def need_bytes(facts: ModelFacts, parallel: int) -> int | None:
     return base_need(facts.size) + parallel * facts.kv_per_slot
 
 
+def card_bytes(host: Host) -> int:
+    """The host's usable VRAM in bytes: `vram_gib` as GiB, floored to whole bytes."""
+    return int(host.vram_gib * GIB)
+
+
 def free_bytes(load: HostLoad) -> int:
-    """Free VRAM in bytes: `vram_gb` as GiB minus the resident models' VRAM minus the need of held, not yet resident, models."""
-    free = load.host.vram_gb * GIB - sum(load.resident.values())
+    """Free VRAM in bytes: `vram_gib` as GiB minus the resident models' VRAM minus the need of held, not yet resident, models."""
+    free = card_bytes(load.host) - sum(load.resident.values())
     for model in set(load.held).difference(load.resident):
         facts = load.models.get(model)
         need = None if facts is None else need_bytes(facts, load.host.parallel)
@@ -65,7 +70,7 @@ def free_bytes(load: HostLoad) -> int:
 
 
 def _required(facts: ModelFacts, load: HostLoad) -> int:
-    """VRAM in bytes to compare with the card (`vram_gb` as GiB): the need, or the base need when the KV size is unknown."""
+    """VRAM in bytes to compare with the card (`vram_gib` as GiB): the need, or the base need when the KV size is unknown."""
     need = need_bytes(facts, load.host.parallel)
     return base_need(facts.size) if need is None else need
 
@@ -77,7 +82,7 @@ def _eligible(model: str, load: HostLoad) -> bool:
         return False
     if need_bytes(facts, load.host.parallel) is None and (load.resident or load.held):
         return False
-    return _required(facts, load) <= load.host.vram_gb * GIB
+    return _required(facts, load) <= card_bytes(load.host)
 
 
 def _loaded_host(model: str, eligible: Sequence[HostLoad]) -> str | None:
