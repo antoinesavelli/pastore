@@ -9,9 +9,11 @@ import os
 import signal
 import sys
 import time
+import urllib.error
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from email.message import Message
 from pathlib import Path
 from subprocess import CompletedProcess
 
@@ -91,6 +93,9 @@ class FakeNet:
     def __call__(self, url: str, body: Mapping[str, object] | None, timeout_s: float) -> object:
         base, _, path = url.partition("/api/")
         self.calls.append(url)
+        # The job endpoint answers but is no gateway, so a failed run stays charged (D-050 (4)).
+        if url.endswith("/pastore/status"):
+            raise urllib.error.HTTPError(url, 404, "Not Found", Message(), None)
         if base in self.link_down or (path == "version" and base in self.version_down):
             raise OSError(f"{base} is down")
         if path == "version":

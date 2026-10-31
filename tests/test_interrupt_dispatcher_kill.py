@@ -7,12 +7,14 @@ import os
 import signal
 import sys
 from collections.abc import Iterator
+from contextlib import closing
 from pathlib import Path
 
 import pytest
 
 from pastore.spec import WORKSTATION
-from pastore.state import lock_is_held
+from pastore.state import lock_is_held, open_state
+from tests import interrupt_harness
 from tests.interrupt_harness import (
     CALLS,
     CONSUMER,
@@ -167,7 +169,28 @@ def test_the_harness_exits_by_itself_after_its_life_cap(tmp_path: Path, fleet: F
     prepared = prepare(tmp_path)
     harness = fleet.spawn(prepared, life_s=2)
     wait_until(lambda: running_job(prepared), 15, "the harness to be ticking")
-    assert harness.proc.wait(timeout=10) == -signal.SIGALRM
+    assert harness.proc.wait(timeout=10) == -signal.SIGKILL
+
+
+def test_a_harness_that_stops_on_request_exits_at_once_not_at_its_life_cap(
+    tmp_path: Path, fleet: Fleet
+) -> None:
+    prepared = prepare(tmp_path, QUICK)
+    harness = fleet.spawn(prepared, life_s=60)
+    wait_until(lambda: [r for r in runs(prepared) if r.status == "done"], 20, "the run to be done")
+    with closing(open_state(prepared.paths)) as state:
+        state.request_stop("graceful")
+    assert harness.proc.wait(timeout=10) == 0  # a non-daemon cap timer would hold it for 60 s
+
+
+def test_the_life_cap_never_arms_inside_an_importing_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    armed: list[object] = []
+    monkeypatch.setattr(interrupt_harness.threading, "Timer", lambda *a: armed.append(a))
+    with pytest.raises(RuntimeError, match="kills the calling process"):
+        interrupt_harness._arm_life_cap(1)
+    assert armed == []  # pytest imported the module: the cap would SIGKILL pytest itself
 
 
 def test_a_recurring_task_runs_again_after_it_is_done(tmp_path: Path, fleet: Fleet) -> None:

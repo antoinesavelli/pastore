@@ -9,11 +9,14 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
+import urllib.error
 from collections.abc import Callable, Collection, Mapping, Sequence
 from contextlib import closing
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
+from email.message import Message
 from pathlib import Path
 from subprocess import CompletedProcess
 from types import TracebackType
@@ -172,6 +175,9 @@ def _read_text(path: Path) -> str:
 def _http_json(url: str, body: Mapping[str, object] | None, timeout_s: float) -> object:
     """Answers for the policy's one host, no network: version, tags (the model), ps (none), show."""
     base, _, path = url.partition("/api/")
+    # The job endpoint answers but is no gateway, so a failed run stays charged (D-050 (4)).
+    if url.endswith("/pastore/status"):
+        raise urllib.error.HTTPError(url, 404, "Not Found", Message(), None)
     if base != WS_URL:
         raise OSError(f"{base} is not a host of the harness policy")
     if path == "version":
@@ -200,10 +206,21 @@ def _start(
     return handle
 
 
+def _arm_life_cap(life_s: int) -> None:
+    """SIGKILL this process after `life_s`; not `signal.alarm`, whose timer is `serve`'s tick bound, and a daemon thread, so a harness that ends sooner exits at once."""
+    if __name__ != "__main__":
+        raise RuntimeError(
+            "the life cap kills the calling process: run `python -m tests.interrupt_harness`"
+        )
+    timer = threading.Timer(life_s, os.kill, (os.getpid(), signal.SIGKILL))
+    timer.daemon = True
+    timer.start()
+
+
 def main(argv: Sequence[str]) -> int:
     """Run the real `serve` loop over the stubbed seams described by the config file; it ends with its parent or after `life_s`."""
     config = Config(**json.loads(Path(argv[0]).read_text()))
-    signal.alarm(config.life_s)
+    _arm_life_cap(config.life_s)
     parent = os.getppid()
     paths = default_paths(Path(config.home))
     host = Host(

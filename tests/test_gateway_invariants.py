@@ -22,6 +22,8 @@ DISPATCHER_ONLY = {
     "pastore.hosts",
     "pastore.manifest",
     "pastore.placement",
+    "pastore.run_end",
+    "pastore.tick_bound",
     "pastore.workload_watch",
 }
 PROBE = (
@@ -82,6 +84,8 @@ def test_invariant_gateway_imports_no_dispatcher_write_path() -> None:
     assert forbidden_imports("x.py", "import pastore.hosts as h")
     assert forbidden_imports("x.py", "def f():\n    from .. import placement\n")
     assert forbidden_imports("x.py", "from ..workload_watch import WorkloadWatch")
+    assert forbidden_imports("x.py", "def f():\n    from pastore.tick_bound import TickOverrun\n")
+    assert forbidden_imports("x.py", "from .. import run_end")
     assert not forbidden_imports(
         "x.py",
         "import pastore.policy\nfrom pastore import spec\nfrom pastore.state import default_paths\n"
