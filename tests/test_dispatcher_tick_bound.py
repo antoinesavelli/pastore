@@ -8,14 +8,17 @@ import inspect
 import signal
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from datetime import datetime
 from pathlib import Path
 from subprocess import CompletedProcess
 
 import pytest
 
 from pastore import dispatcher as dispatcher_module
+from pastore import policy as policy_module
 from pastore.checks import Host
 from pastore.dispatcher import Dispatcher, serve
+from pastore.policy import PolicyCache
 from pastore.runner import RunDir
 from pastore.spec import Ready, TaskSpec
 from pastore.tick_bound import TickOverrun
@@ -30,13 +33,14 @@ NO_TIMER = (0.0, 0.0)
 
 @pytest.fixture(autouse=True)
 def clean_alarm() -> Iterator[None]:
-    """No test leaves a timer armed or a SIGALRM handler of its own behind."""
-    before = signal.getsignal(signal.SIGALRM)
+    """No test leaves a timer armed or a SIGALRM or SIGTERM handler of its own behind."""
+    before = signal.getsignal(signal.SIGALRM), signal.getsignal(signal.SIGTERM)
     try:
         yield
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, before)
+        signal.signal(signal.SIGALRM, before[0])
+        signal.signal(signal.SIGTERM, before[1])
 
 
 class Blocker:
@@ -57,6 +61,19 @@ class Blocker:
         return CompletedProcess(list(argv), self.rc, "", "")
 
 
+class Failing:
+    """The injected run_in: works for `work_s`, then fails."""
+
+    def __init__(self, work_s: float) -> None:
+        self.work_s = work_s
+
+    def __call__(
+        self, argv: Sequence[str], cwd: Path, env: Mapping[str, str]
+    ) -> CompletedProcess[str]:
+        time.sleep(self.work_s)
+        raise RuntimeError("the check failed")
+
+
 class SlowHandle(FakeHandle):
     """A handle whose stop takes `LATE_S`."""
 
@@ -72,6 +89,7 @@ class Drive:
         self.rig = rig
         self.dispatchers: list[Dispatcher] = []
         self.timers: list[tuple[float, float]] = []
+        self.clock_timers: list[tuple[float, float]] = []
         self.naps = 0
         spy = self.dispatchers
 
@@ -94,7 +112,7 @@ class Drive:
         bound_s: float = BOUND_S,
         real_nap_s: float = 0.0,
     ) -> None:
-        """Serve until the callback has requested a stop; every nap also records the timer state."""
+        """Serve until the callback has requested a stop; every nap and every clock read also records the timer state."""
 
         def sleep(_seconds: float) -> None:
             self.naps += 1
@@ -104,12 +122,16 @@ class Drive:
             self.rig.clock.advance(5)
             on_nap(self.naps)
 
+        def clock() -> datetime:
+            self.clock_timers.append(signal.getitimer(signal.ITIMER_REAL))
+            return self.rig.clock()
+
         deps = self.rig.deps
         assert (
             serve(
                 deps,
                 self.rig.policy,
-                clock=self.rig.clock,
+                clock=clock,
                 sleep=sleep,
                 tick_s=1.0,
                 tick_bound_s=bound_s,
@@ -409,3 +431,171 @@ def test_a_pending_overrun_is_dropped_when_the_next_tick_starts(tmp_path: Path) 
 def test_serve_bounds_a_tick_at_sixty_seconds_by_default() -> None:
     assert dispatcher_module.TICK_BOUND_S == 60.0
     assert inspect.signature(serve).parameters["tick_bound_s"].default == 60.0
+
+
+def test_a_tick_that_fails_late_leaves_no_timer_to_fire_in_the_nap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec = task(tmp_path, "a", ready=Ready(1, ("./ready",)))
+    rig = rig_with(tmp_path, [spec], run_in=Failing(0.2))
+    drive = Drive(rig, monkeypatch)
+    # The tick fails 0.2 s into its 0.3 s bound and the nap lasts 0.4 s: a timer left armed would fire in the nap.
+    drive.run(lambda _n: rig.state.request_stop("now"), real_nap_s=0.4)
+    assert drive.timers == [NO_TIMER]
+    assert drive.overruns() == ["RuntimeError: the check failed"]
+
+
+def test_the_timer_is_disarmed_before_the_tick_error_is_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec = task(tmp_path, "a", ready=Ready(1, ("./ready",)))
+    rig = rig_with(tmp_path, [spec], run_in=Failing(0.0))
+    drive = Drive(rig, monkeypatch)
+
+    def on_nap(_n: int) -> None:
+        armed, recording = drive.clock_timers[
+            -2:
+        ]  # the tick's own clock read, then the tick-error's
+        assert 0 < armed[0] <= 5.0 and recording == NO_TIMER
+        rig.state.request_stop("now")
+
+    drive.run(on_nap, bound_s=5.0)
+    assert drive.overruns() == ["RuntimeError: the check failed"]
+
+
+def test_an_overrun_after_the_run_now_was_read_keeps_the_request_and_the_next_tick_starts_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    blocker = Blocker(rc=1)
+    specs = [
+        task(tmp_path, "a", ready=Ready(3600, ("./ready",))),
+        task(tmp_path, "b", ready=Ready(1, ("./ready",))),
+    ]
+    rig = rig_with(tmp_path, specs, run_in=blocker)
+    rig.next_codes = [None]
+    drive = Drive(rig, monkeypatch)
+    key = ("c/a", MODEL)
+
+    def on_nap(n: int) -> None:
+        if n == 1:
+            assert rig.handles == []  # neither pair is ready
+            rig.state.request_run_now(*key)
+            blocker.block.add(
+                "./ready"
+            )  # b's ready check, after the request was read, outlives the bound
+        elif n == 2:
+            assert drive.overruns() == ["TickOverrun: tick ran past 0.3 s"]
+            assert rig.state.run_now_requested() == key and rig.handles == []
+            assert rig.events("refused") == []
+            blocker.block.clear()
+        else:
+            assert rig.state.run_now_requested() is None and len(rig.handles) == 1
+            assert [e.ref for e in rig.events("run-start")] == ["c/a"]
+            rig.state.request_stop("now")
+
+    drive.run(on_nap)
+
+
+def test_a_newer_run_now_for_another_pair_survives_the_start_of_the_first(tmp_path: Path) -> None:
+    def newer_request(
+        argv: Sequence[str], cwd: Path, env: Mapping[str, str]
+    ) -> CompletedProcess[str]:
+        rig.state.request_run_now("c/b", MODEL)  # arrives while the tick is under way
+        return CompletedProcess(list(argv), 1, "", "")
+
+    specs = [
+        task(tmp_path, "a", ready=Ready(3600, ("./ready",))),
+        task(tmp_path, "b", ready=Ready(3600, ("./ready",))),
+    ]
+    rig = rig_with(tmp_path, specs, run_in=newer_request)
+    rig.state.request_run_now("c/a", MODEL)
+    rig.tick()
+    assert [e.ref for e in rig.events("run-start")] == ["c/a"]
+    assert rig.state.run_now_requested() == ("c/b", MODEL)
+    rig.tick()
+    assert [e.ref for e in reversed(rig.events("run-start"))] == ["c/a", "c/b"]
+    assert rig.state.run_now_requested() is None
+
+
+class CutOnce:
+    """Wraps `state.record_event` so the first event of `kind` raises TickOverrun, as an overrun between two writes would."""
+
+    def __init__(self, rig: Rig, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.real = rig.state.record_event
+        self.kind = kind
+        self.cut = False
+        monkeypatch.setattr(rig.state, "record_event", self)
+
+    def __call__(self, now: datetime, kind: str, ref: str | None = None, detail: str = "") -> None:
+        if kind == self.kind and not self.cut:
+            self.cut = True
+            raise TickOverrun("cut")
+        self.real(now, kind, ref, detail)
+
+
+def test_an_interruption_around_the_starved_event_repeats_it_and_never_loses_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig = Rig(tmp_path, [task(tmp_path, "a")], ["c/a"], host=host(module="580.159.03"))
+    rig.tick()
+    rig.clock.advance(25 * 3600)
+    cut = CutOnce(rig, "starved", monkeypatch)
+    with pytest.raises(TickOverrun):
+        rig.tick()
+    job = rig.state.get_job("c/a", MODEL)
+    assert cut.cut and rig.events("starved") == [] and job is not None and job.starved_flagged == 0
+    rig.tick()
+    rig.tick()
+    assert len(rig.events("starved")) == 1
+
+
+def test_an_interruption_around_a_refused_event_repeats_it_and_never_loses_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig = Rig(tmp_path, [task(tmp_path, "a")], ["c/a"])
+    rig.specs["a"] = task(
+        tmp_path, "a", fingerprint="fp-edited"
+    )  # no contract pass: refused each tick
+    cut = CutOnce(rig, "refused", monkeypatch)
+    with pytest.raises(TickOverrun):
+        rig.tick()
+    assert cut.cut and rig.events("refused") == []
+    rig.tick()
+    rig.tick()
+    assert len(rig.events("refused")) == 1
+
+
+def test_a_policy_edit_is_not_ignored_when_reading_it_was_interrupted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig = Rig(tmp_path, [task(tmp_path, "a"), task(tmp_path, "b")], ["c/a"])
+    cache = PolicyCache(rig.policy, lambda _message: None)
+    assert [p.task for p in cache.current().jobs] == ["c/a"]
+    rig.list_jobs(["c/a", "c/b"])
+    real, calls = policy_module.parse_policy, []
+
+    def interrupted(text: str) -> policy_module.Policy:
+        calls.append(text)
+        if len(calls) == 1:
+            raise TickOverrun("cut")
+        return real(text)
+
+    monkeypatch.setattr(policy_module, "parse_policy", interrupted)
+    with pytest.raises(TickOverrun):
+        cache.current()
+    assert [p.task for p in cache.current().jobs] == ["c/a", "c/b"]
+
+
+def test_serve_restores_both_handlers_when_its_setup_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig = rig_with(tmp_path, [task(tmp_path, "a")])
+    before = signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGALRM)
+
+    def failing_recover(_self: Dispatcher, _now: datetime) -> None:
+        raise RuntimeError("recover failed")
+
+    monkeypatch.setattr(Dispatcher, "recover", failing_recover)
+    with pytest.raises(RuntimeError, match="recover failed"):
+        serve(rig.deps, rig.policy, clock=rig.clock, sleep=lambda _s: None, tick_bound_s=BOUND_S)
+    assert (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGALRM)) == before
