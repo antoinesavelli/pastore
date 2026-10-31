@@ -357,11 +357,22 @@ def test_status_shows_one_line_per_pair_and_no_window_line(env: Env) -> None:
     assert sum(line.startswith("torra/bench ") for line in lines) == 2
 
 
-def evidence_status(env: Env) -> list[str]:
-    """Write the pair-line policy (MODEL on the fixture's evidence, OTHER on a copy), create state, return the status lines."""
+FIRST_FLAGGED = [
+    "dispatcher: dispatcher-down",
+    "idle: none",
+    "workload watch: not run yet",
+    "torra/bench qwen3:8b: unseen attempts=0 last_run=none evidence-changed",
+    "torra/bench gemma3:4b: unseen attempts=0 last_run=none",
+    REFUSED,
+]
+
+
+def evidence_status(env: Env, first: Path | None = None) -> list[str]:
+    """Write the pair-line policy (MODEL on `first` or the fixture's evidence, OTHER on a copy), create state, return the status lines."""
     second = env.evidence.with_name("second.md")
     second.write_bytes(EVIDENCE)
-    env.write_policy(("torra/bench", MODEL), ("torra/bench", OTHER), evidence={OTHER: second})
+    named = {OTHER: second} | ({MODEL: first} if first else {})
+    env.write_policy(("torra/bench", MODEL), ("torra/bench", OTHER), evidence=named)
     open_state(env.paths).close()
     return env.run("status")[1].splitlines()
 
@@ -418,15 +429,28 @@ def test_status_flags_an_unreadable_evidence_file_and_still_prints_every_other_l
     env: Env, unreadable: Callable[[Path], None]
 ) -> None:
     unreadable(env.evidence)
-    assert evidence_status(env) == [
-        "dispatcher: dispatcher-down",
-        "idle: none",
-        "workload watch: not run yet",
-        "torra/bench qwen3:8b: unseen attempts=0 last_run=none evidence-changed",
-        "torra/bench gemma3:4b: unseen attempts=0 last_run=none",
-        REFUSED,
-    ]
+    assert evidence_status(env) == FIRST_FLAGGED
     assert env.run("status")[0] == 0
+
+
+@pytest.mark.parametrize("cause", ["name-too-long", "parent-not-searchable"])
+def test_status_flags_evidence_whose_stat_itself_fails_and_still_prints_every_other_line(
+    env: Env, tmp_path: Path, cause: str
+) -> None:
+    """`is_file()` raises (ENAMETOOLONG, EACCES) rather than answering False; status must flag it, not crash."""
+    parent = tmp_path / "locked"
+    parent.mkdir()
+    (parent / "evidence.md").write_bytes(EVIDENCE)
+    first = tmp_path / ("x" * 300 if cause == "name-too-long" else "locked/evidence.md")
+    if cause == "parent-not-searchable":
+        if os.geteuid() == 0:
+            pytest.skip("root searches any directory")
+        parent.chmod(0)
+    try:
+        assert evidence_status(env, first) == FIRST_FLAGGED
+        assert env.run("status")[0] == 0
+    finally:
+        parent.chmod(0o700)
 
 
 def test_relisting_a_pair_clears_the_evidence_changed_flag(env: Env) -> None:
