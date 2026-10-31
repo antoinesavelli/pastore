@@ -999,6 +999,44 @@ def test_read_reach_keeps_only_the_last_reach_cap_lines(
     assert len(got) == sx.REACH_CAP and got[0] == "n5 health=ok"
 
 
+class _FinishedChild:
+    """A child that already exited 0 with no output (no real process is ever started)."""
+
+    stdout = None
+
+    def poll(self) -> int:
+        return 0
+
+
+def test_run_children_sends_ssh_to_the_given_ssh_host_and_ping_to_the_ping_host(
+    monkeypatch: pytest.MonkeyPatch, sx: ModuleType
+) -> None:
+    """The ssh alias and the ping address come from the arguments, never from the module's default alias."""
+    spawned: list[list[str]] = []
+
+    def fake_spawn(argv: list[str], _stdin: object, _stderr: object) -> _FinishedChild:
+        spawned.append(argv)
+        return _FinishedChild()
+
+    monkeypatch.setattr(sx, "_spawn", fake_spawn)
+    args = argparse.Namespace(ssh_host="my-box", ping_host="192.0.2.7", duration=60.0, interval=5.0)
+    assert sx._run_children(args, (None, None, None), lambda _r: None, Counter(), []) == (0, 0)
+    ssh_argv, ping_argv = spawned
+    assert ssh_argv == [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=10",
+        "-T",
+        "my-box",
+        "sh",
+        "-s",
+    ]
+    assert sx.SSH_HOST not in ssh_argv
+    assert ping_argv[0] == "ping" and ping_argv[-1] == "192.0.2.7"
+
+
 def test_the_record_arguments_default_to_generic_names_and_take_the_hosts_own(
     monkeypatch: pytest.MonkeyPatch, sx: ModuleType
 ) -> None:
@@ -1128,12 +1166,12 @@ def test_summarize_assigns_records_to_half_open_windows_and_prints_table_reach_a
             _ping(4, None, 10.0),
             _ping(5, 5.0, 31.0),
             _ping(6, 7.0, 20.0),
-            {"kind": "reach", "lines": ["t1 health=ok", "t2 health=down"]},
-            {"kind": "reach", "lines": ["t3 health=ok"]},
+            {"kind": "reach", "lines": ["t1 state=up", "t2 state=down"]},
+            {"kind": "reach", "lines": ["t3 state=up"]},
         ),
     )
     args = argparse.Namespace(
-        samples=samples, phases=phases, json=True, up_text=sx.UP_TEXT, down_text=sx.DOWN_TEXT
+        samples=samples, phases=phases, json=True, up_text="state=up", down_text="state=down"
     )
     assert sx.summarize(args) == 0
     out = capsys.readouterr().out.splitlines()
@@ -1151,16 +1189,16 @@ def test_summarize_assigns_records_to_half_open_windows_and_prints_table_reach_a
     ]
     assert out[-5:-1] == [
         "reach: 3 lines, up=2 down=1",
-        "  t1 health=ok",
-        "  t2 health=down",
-        "  t3 health=ok",
+        "  t1 state=up",
+        "  t2 state=down",
+        "  t3 state=up",
     ]
     stats = json.loads(out[-1])
     assert stats["reach"] == {
         "lines": 3,
         "up": 2,
         "down": 1,
-        "raw": ["t1 health=ok", "t2 health=down", "t3 health=ok"],
+        "raw": ["t1 state=up", "t2 state=down", "t3 state=up"],
     }
     windows = stats["windows"]
     assert list(windows) == ["before", "workstation", "both", "after"]

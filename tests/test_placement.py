@@ -244,19 +244,19 @@ def test_a_model_fits_when_the_need_equals_free_vram_and_not_one_byte_less() -> 
     assert place(MODEL, [tight]) is None
 
 
-@pytest.mark.parametrize(("gib", "card"), [(5.6, 6_012_954_214), (5.7, 6_120_328_396)])
+@pytest.mark.parametrize(("gib", "floor_bytes"), [(5.6, 6_012_954_214), (5.7, 6_120_328_396)])
 def test_a_fractional_card_is_floored_to_whole_bytes_and_the_boundary_is_exact(
-    gib: float, card: int
+    gib: float, floor_bytes: int
 ) -> None:
     """5.6 GiB is 6012954214.4 bytes and 5.7 GiB is 6120328396.8: floor, not round, gives the figures above."""
     ex = host("executor", gib)
-    assert free_bytes(load(ex)) == card
+    assert free_bytes(load(ex)) == floor_bytes
 
     def on_card(need: int) -> HostLoad:
         return load(ex, models={MODEL: ModelFacts(SMALL, 0, loaded=need)})
 
-    assert place(MODEL, [on_card(card)]) == "executor"
-    assert place(MODEL, [on_card(card + 1)]) is None
+    assert place(MODEL, [on_card(floor_bytes)]) == "executor"
+    assert place(MODEL, [on_card(floor_bytes + 1)]) is None
 
 
 def test_a_host_at_max_models_is_not_eligible() -> None:
