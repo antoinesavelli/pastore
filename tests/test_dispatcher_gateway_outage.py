@@ -12,7 +12,9 @@ from pathlib import Path
 
 import pytest
 
+from pastore.dispatcher import Dispatcher
 from pastore.hosts import PROBE_TIMEOUT_S
+from pastore.policy import PolicyCache
 from pastore.run_end import MAX_ATTEMPTS, gateway_outage
 from pastore.spec import Ready
 from pastore.state import RunRow
@@ -226,18 +228,29 @@ def outage_rig(tmp_path: Path, kind: str, **task_kw: object) -> tuple[Rig, Switc
     return rig, switch
 
 
-def place_and_end(rig: Rig, switch: Switch, *, outage: bool) -> RunRow:
-    """Place the pair's next run with every outage up, then end it with the outage down or up; placement is held for the end, so nothing else starts."""
-    stop_file = rig.paths.stop_file
+def place(rig: Rig, switch: Switch) -> RunRow:
+    """Place the pair's next run with every outage up, and leave it running."""
     rig.clock.advance(30)
-    stop_file.unlink(missing_ok=True)
+    rig.paths.stop_file.unlink(missing_ok=True)
     switch(False)
     rig.tick()
     [run] = rig.state.runs_with_status("running")
-    stop_file.write_text("")
+    return run
+
+
+def place_and_end(rig: Rig, switch: Switch, *, outage: bool) -> RunRow:
+    """Place the pair's next run, then end it with the outage down or up; placement is held for the end, so nothing else starts."""
+    run = place(rig, switch)
+    rig.paths.stop_file.write_text("")
     switch(outage)
     rig.tick()
     return run
+
+
+def restart(rig: Rig) -> None:
+    """A dispatcher start over the same state: a fresh Dispatcher, then `recover`, as `serve` does."""
+    rig.d = Dispatcher(rig.deps, rig.state, PolicyCache(rig.policy, lambda _m: None))
+    rig.d.recover(rig.clock())
 
 
 def counts(rig: Rig) -> tuple[str, int, int]:
@@ -287,6 +300,57 @@ def test_a_normal_end_between_two_outage_ends_makes_the_second_free_again(
     assert counts(rig) == ("pending", after_middle[1], 1)
     assert_stopped_by(rig, first, "gateway")
     assert_stopped_by(rig, last, "gateway")
+    assert rig.events("failed") == []
+
+
+@pytest.mark.parametrize("kind", ["gateway", "executor"])
+def test_a_crash_recovered_between_two_outage_ends_extends_the_same_streak(
+    tmp_path: Path, kind: str
+) -> None:
+    rig, switch = outage_rig(tmp_path, kind)
+    rig.next_codes = [1]
+    place_and_end(rig, switch, outage=True)
+    assert counts(rig) == ("pending", 0, 1)
+    place(rig, switch)
+    restart(rig)
+    assert len(rig.state.runs_with_status("crashed")) == 1
+    assert counts(rig) == ("pending", 1, 2)
+    last = place_and_end(rig, switch, outage=True)
+    assert counts(rig) == ("pending", 2, 3)
+    assert_stopped_by(rig, last, kind)
+    assert rig.events("failed") == []
+
+
+@pytest.mark.parametrize("kind", ["gateway", "executor"])
+def test_an_outage_end_after_a_recovered_crash_charges_an_attempt(
+    tmp_path: Path, kind: str
+) -> None:
+    rig, switch = outage_rig(tmp_path, kind)
+    rig.next_codes = [1]
+    place(rig, switch)
+    restart(rig)
+    assert len(rig.state.runs_with_status("crashed")) == 1
+    assert counts(rig) == ("pending", 0, 1)
+    last = place_and_end(rig, switch, outage=True)
+    assert counts(rig) == ("pending", 1, 2)
+    assert_stopped_by(rig, last, kind)
+    assert rig.events("failed") == []
+
+
+@pytest.mark.parametrize("kind", ["gateway", "executor"])
+def test_a_dispatcher_start_that_found_the_pair_idle_ends_its_outage_streak(
+    tmp_path: Path, kind: str
+) -> None:
+    rig, switch = outage_rig(tmp_path, kind)
+    rig.next_codes = [1]
+    place_and_end(rig, switch, outage=True)
+    assert counts(rig) == ("pending", 0, 1)
+    restart(rig)
+    assert rig.state.runs_with_status("crashed") == []
+    assert counts(rig) == ("pending", 0, 0)
+    last = place_and_end(rig, switch, outage=True)
+    assert counts(rig) == ("pending", 0, 1)
+    assert_stopped_by(rig, last, kind)
     assert rig.events("failed") == []
 
 
