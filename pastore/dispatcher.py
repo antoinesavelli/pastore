@@ -22,7 +22,14 @@ from pastore.manifest import ManifestError
 from pastore.placement import HostLoad, ModelFacts, kv_bytes_per_slot, place
 from pastore.policy import Policy, PolicyCache
 from pastore.runner import RunDir, Runner, fresh_run_dir, stop_leftovers
-from pastore.spec import BASE_ENV_KEYS, WORKSTATION, RunReader, TaskSpec, idle_reason
+from pastore.spec import (
+    BASE_ENV_KEYS,
+    WORKSTATION,
+    RunReader,
+    TaskSpec,
+    canonical_model,
+    idle_reason,
+)
 from pastore.state import DispatcherLock, JobRow, RunRow, State, StatePaths, open_state
 
 MAX_ATTEMPTS = 3
@@ -313,7 +320,11 @@ class Dispatcher:
                     for model, size in state.sizes.items()
                 },
                 state.resident,
-                tuple(a.model for a in self.active.values() if a.host == state.host.name),
+                tuple(
+                    canonical_model(a.model)
+                    for a in self.active.values()
+                    if a.host == state.host.name
+                ),
             )
             for state in states
             if state.reason is None
@@ -330,14 +341,15 @@ class Dispatcher:
         """Start each ready unit where it fits, in order; the number of starts attempted."""
         attempted = 0
         for unit in ready:
-            host = place(unit[1], loads)
+            model = canonical_model(unit[1])
+            host = place(model, loads)
             if host is None:
                 if unit is forced:
                     self._refuse_run_now(now, unit, reason)
                 continue
             attempted += 1
             if self._start(now, *unit, host):
-                _hold(loads, host, unit[1])
+                _hold(loads, host, model)
         return attempted
 
     def _listed(self, now: datetime, policy: Policy) -> list[Unit]:

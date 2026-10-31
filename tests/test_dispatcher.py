@@ -23,7 +23,15 @@ from pastore.fake_ollama import FakeOllama
 from pastore.hosts import http_json
 from pastore.policy import PolicyCache, PolicyError
 from pastore.runner import RunDir, start_run
-from pastore.spec import IDLE_REASONS, WORKSTATION, Ready, RunReader, TaskSpec, ValidateReader
+from pastore.spec import (
+    IDLE_REASONS,
+    WORKSTATION,
+    Ready,
+    RunReader,
+    TaskSpec,
+    ValidateReader,
+    canonical_model,
+)
 from pastore.state import (
     DispatcherLock,
     EventRow,
@@ -37,6 +45,7 @@ from tests.fakes import FakeClock, RecordingRunner
 
 T0 = datetime(2026, 10, 24, 2, 0, tzinfo=UTC)
 MODEL = "m"
+LATEST = canonical_model(MODEL)
 SHA256 = "a" * 64
 GIB = 1024**3
 EXECUTOR = "executor"
@@ -1098,14 +1107,85 @@ def test_a_pair_listed_later_is_placed_next_to_a_run_already_in_flight(tmp_path:
     assert [r.model for r in rig.state.runs_with_status("running")] == ["m1", "m2"]
 
 
+@pytest.mark.parametrize(
+    ("pair_model", "listed"),
+    [
+        ("nomic-embed-text", "nomic-embed-text:latest"),
+        ("devstral:24b", "devstral:24b"),
+        ("hf.co/bartowski/x-GGUF:IQ4_XS", "hf.co/bartowski/x-GGUF:IQ4_XS"),
+        ("registry.local:5000/foo", "registry.local:5000/foo:latest"),
+    ],
+)
+def test_a_pair_places_on_the_host_that_lists_its_model_by_ollamas_name_and_runs_under_its_own(
+    tmp_path: Path, pair_model: str, listed: str
+) -> None:
+    net = net_of({listed: GIB})
+    rig = fleet_rig(tmp_path, net, [("c/a", pair_model)], models=(pair_model,))
+    rig.tick()
+    [run] = rig.state.runs_with_status("running")
+    assert (run.model, run.host) == (pair_model, WORKSTATION)
+    assert rig.start_models == [pair_model]
+    assert rig.job_status("a", pair_model) == "running"
+
+
+def test_a_pair_prefers_the_host_where_ollama_lists_its_model_as_latest_in_ps(
+    tmp_path: Path,
+) -> None:
+    net = net_of({"x:latest": GIB}, {"x:latest": GIB})
+    net.ps[WS_URL] = {"x:latest": (GIB, GIB)}
+    rig = fleet_rig(tmp_path, net, [("c/a", "x")], models=("x",))
+    rig.tick()
+    [run] = rig.state.runs_with_status("running")
+    assert run.host == WORKSTATION
+
+
+def test_the_loaded_size_of_a_latest_model_replaces_the_estimate_of_its_untagged_pair(
+    tmp_path: Path,
+) -> None:
+    net = net_of({"x:latest": 5 * GIB}, {"x:latest": 5 * GIB})
+    net.ps[EX_URL] = {"x:latest": (6 * GIB, 11 * GIB)}  # 11 GiB loaded: over the 10 GiB card
+    rig = fleet_rig(tmp_path, net, [("c/a", "x")], models=("x",))
+    rig.tick()
+    [run] = rig.state.runs_with_status("running")
+    assert run.host == WORKSTATION
+
+
+def test_d023_one_run_of_an_untagged_model_per_host_among_pairs_placed_in_one_tick(
+    tmp_path: Path,
+) -> None:
+    net = net_of({"x:latest": GIB}, {"x:latest": GIB})
+    net.ps[EX_URL] = {"x:latest": (GIB, GIB)}  # loaded there, so only the held check keeps it away
+    jobs = [("c/a", "x"), ("c/b", "x"), ("c/c", "x")]
+    rig = fleet_rig(tmp_path, net, jobs, models=("x",), ids=("a", "b", "c"))
+    rig.next_codes = [None]
+    rig.tick()
+    rows = rig.state.runs_with_status("running")
+    assert [(r.ref, r.host) for r in rows] == [("c/a", EXECUTOR), ("c/b", WORKSTATION)]
+    assert rig.job_status("c", "x") == "pending"
+
+
+def test_d023_a_pair_listed_later_does_not_double_up_the_untagged_model_of_a_run_in_flight(
+    tmp_path: Path,
+) -> None:
+    net = net_of({"x:latest": GIB}, {"x:latest": GIB})
+    net.ps[EX_URL] = {"x:latest": (GIB, GIB)}  # loaded there, so only the held check keeps it away
+    rig = fleet_rig(tmp_path, net, [("c/a", "x")], models=("x",), ids=("a", "b"))
+    rig.next_codes = [None]
+    rig.tick()
+    rig.list_jobs([("c/a", "x"), ("c/b", "x")])
+    rig.tick()
+    rows = rig.state.runs_with_status("running")
+    assert [(r.ref, r.host) for r in rows] == [("c/a", EXECUTOR), ("c/b", WORKSTATION)]
+
+
 @pytest.mark.parametrize(("context", "starts"), [(32768, False), (8192, True)])
 def test_the_kv_cache_is_counted_at_the_hosts_context(
     tmp_path: Path, context: int, starts: bool
 ) -> None:
     net = net_of({MODEL: GIB})
     net.ps[WS_URL] = {"other": (20 * GIB, 20 * GIB)}  # 4 GiB free
-    net.info[MODEL] = {**INFO, "llama.block_count": 32, "llama.attention.head_count_kv": 8}
-    net.info[MODEL]["llama.attention.key_length"] = 64  # 2 GiB a slot at 32768, 0.5 GiB at 8192
+    net.info[LATEST] = {**INFO, "llama.block_count": 32, "llama.attention.head_count_kv": 8}
+    net.info[LATEST]["llama.attention.key_length"] = 64  # 2 GiB a slot at 32768, 0.5 GiB at 8192
     hosts = {WORKSTATION: replace(WORKSTATION_ONLY[WORKSTATION], context=context)}
     rig = fleet_rig(tmp_path, net, ["c/a"], hosts=hosts)
     rig.tick()
@@ -1316,7 +1396,7 @@ def test_the_kv_cache_is_counted_at_the_executors_own_context(
     net = net_of({}, {MODEL: GIB // 2})
     net.ps[EX_URL] = {"other": (7 * GIB, 7 * GIB)}  # 3 GiB free of 10
     info = {**INFO, "llama.block_count": 32, "llama.attention.head_count_kv": 8}
-    net.info[MODEL] = {**info, "llama.attention.key_length": 128}  # 1 GiB per slot at 8192
+    net.info[LATEST] = {**info, "llama.attention.key_length": 128}  # 1 GiB per slot at 8192
     hosts = {**WORKSTATION_ONLY, EXECUTOR: replace(FLEET[EXECUTOR], context=context, parallel=1)}
     rig = fleet_rig(tmp_path, net, ["c/a"], hosts=hosts)
     rig.tick()

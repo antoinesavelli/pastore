@@ -22,7 +22,10 @@ class ModelFacts:
 
 @dataclass(frozen=True)
 class HostLoad:
-    """One healthy host as placement sees it: its models, loaded models (size_vram) and one `held` entry per run."""
+    """One healthy host as placement sees it: its models, loaded models (size_vram) and one `held` entry per run.
+
+    Every model name here, and the one passed to `place`, is in canonical form (spec.canonical_model).
+    """
 
     host: Host
     models: Mapping[str, ModelFacts]

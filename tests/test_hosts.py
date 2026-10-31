@@ -32,7 +32,7 @@ from pastore.hosts import (
     ps_sizes,
     read_host,
 )
-from pastore.spec import WORKSTATION, Host
+from pastore.spec import WORKSTATION, Host, canonical_model
 
 EXECUTOR_URL = "http://executor.test:11434"
 WS_URL = "http://workstation.test:11434"
@@ -78,7 +78,8 @@ class Recorder:
         raises: Mapping[str, Exception] | None = None,
     ) -> None:
         self.answers = {**HEALTHY, **(answers or {})}
-        self.show = {"a": {"model_info": LLAMA_INFO}, **(show or {})}
+        shown = {"a": {"model_info": LLAMA_INFO}, **(show or {})}
+        self.show = {canonical_model(name): answer for name, answer in shown.items()}
         self.raises = dict(raises or {})
         self.calls: list[tuple[str, Mapping[str, object] | None, float]] = []
 
@@ -89,7 +90,7 @@ class Recorder:
             raise self.raises[path]
         if path == "/api/show":
             assert body is not None
-            return self.show[str(body["model"])]
+            return self.show[canonical_model(str(body["model"]))]
         return self.answers[path]
 
 
@@ -195,12 +196,14 @@ def test_executor_host_is_probed_then_read_then_shown_with_the_read_timeout() ->
     assert READ_TIMEOUT_S == 5.0
     recorder = Recorder()
     state = read_host(make_host(), recorder, ["a"])
-    assert state == HostState(make_host(), None, {"a": 100}, {}, {}, {"a": LLAMA_SHAPE})
+    assert state == HostState(
+        make_host(), None, {"a:latest": 100}, {}, {}, {"a:latest": LLAMA_SHAPE}
+    )
     assert recorder.calls == [
         (EXECUTOR_URL + "/api/version", None, 2.0),
         (EXECUTOR_URL + "/api/tags", None, 5.0),
         (EXECUTOR_URL + "/api/ps", None, 5.0),
-        (EXECUTOR_URL + "/api/show", {"model": "a"}, 5.0),
+        (EXECUTOR_URL + "/api/show", {"model": "a:latest"}, 5.0),
     ]
 
 
@@ -210,7 +213,7 @@ def test_workstation_is_not_probed_for_a_version() -> None:
     assert recorder.calls == [
         (WS_URL + "/api/tags", None, 5.0),
         (WS_URL + "/api/ps", None, 5.0),
-        (WS_URL + "/api/show", {"model": "a"}, 5.0),
+        (WS_URL + "/api/show", {"model": "a:latest"}, 5.0),
     ]
 
 
@@ -247,10 +250,13 @@ def test_ps_gives_size_vram_as_resident_and_size_as_loaded() -> None:
         ]
     }
     resident, loaded = ps_sizes(make_host(), Recorder({"/api/ps": ps}))
-    assert resident == {"a": 90, "b": 7}
-    assert loaded == {"a": 120, "b": 7}
+    assert resident == {"a:latest": 90, "b:latest": 7}
+    assert loaded == {"a:latest": 120, "b:latest": 7}
     state = read_host(make_host(), Recorder({"/api/ps": ps}), [])
-    assert (dict(state.resident), dict(state.loaded)) == ({"a": 90, "b": 7}, {"a": 120, "b": 7})
+    assert (dict(state.resident), dict(state.loaded)) == (
+        {"a:latest": 90, "b:latest": 7},
+        {"a:latest": 120, "b:latest": 7},
+    )
 
 
 def test_tags_read_size_and_ignore_other_fields() -> None:
@@ -260,12 +266,12 @@ def test_tags_read_size_and_ignore_other_fields() -> None:
             {"name": "b", "size": 5},
         ]
     }
-    assert model_sizes(make_host(), Recorder({"/api/tags": tags})) == {"a": 0, "b": 5}
+    assert model_sizes(make_host(), Recorder({"/api/tags": tags})) == {"a:latest": 0, "b:latest": 5}
 
 
 def test_ps_accepts_zero_sizes_and_ignores_other_fields() -> None:
     ps = {"models": [{"name": "a", "size_vram": 0, "size": 0, "expires_at": "later"}]}
-    assert ps_sizes(make_host(), Recorder({"/api/ps": ps})) == ({"a": 0}, {"a": 0})
+    assert ps_sizes(make_host(), Recorder({"/api/ps": ps})) == ({"a:latest": 0}, {"a:latest": 0})
 
 
 def test_empty_models_lists_are_valid() -> None:
@@ -439,31 +445,68 @@ def test_read_host_gives_kv_only_for_requested_models_present_in_tags() -> None:
     show = {"b": {"model_info": patched({"llama.block_count": 40})}}
     recorder = Recorder({"/api/tags": tags}, show=show)
     state = read_host(workstation(), recorder, ["a", "c"])
-    assert state.kv == {"a": LLAMA_SHAPE}
-    assert state.sizes == {"a": 1, "b": 2}
+    assert state.kv == {"a:latest": LLAMA_SHAPE}
+    assert state.sizes == {"a:latest": 1, "b:latest": 2}
     assert [c for c in recorder.calls if c[0].endswith("/api/show")] == [
-        (WS_URL + "/api/show", {"model": "a"}, 5.0)
+        (WS_URL + "/api/show", {"model": "a:latest"}, 5.0)
     ]
 
 
 def test_read_host_asks_show_once_per_distinct_model() -> None:
     recorder = Recorder()
     state = read_host(workstation(), recorder, ["a", "a"])
-    assert state.kv == {"a": LLAMA_SHAPE}
+    assert state.kv == {"a:latest": LLAMA_SHAPE}
     assert sum(c[0].endswith("/api/show") for c in recorder.calls) == 1
 
 
 def test_read_host_with_no_models_asks_show_nothing() -> None:
     recorder = Recorder()
     state = read_host(workstation(), recorder, [])
-    assert state == HostState(workstation(), None, {"a": 100}, {}, {}, {})
+    assert state == HostState(workstation(), None, {"a:latest": 100}, {}, {}, {})
     assert not any(c[0].endswith("/api/show") for c in recorder.calls)
 
 
 def test_read_host_keeps_a_model_with_missing_kv_fields_as_none() -> None:
     state = read_host(workstation(), Recorder(show={"a": {"model_info": {}}}), ["a"])
     assert state.reason is None
-    assert state.kv == {"a": None}
+    assert state.kv == {"a:latest": None}
+
+
+@pytest.mark.parametrize(
+    ("name", "canonical"),
+    [
+        ("nomic-embed-text", "nomic-embed-text:latest"),
+        ("nomic-embed-text:latest", "nomic-embed-text:latest"),
+        ("devstral:24b", "devstral:24b"),
+        ("hf.co/bartowski/x-GGUF:IQ4_XS", "hf.co/bartowski/x-GGUF:IQ4_XS"),
+        ("hf.co/bartowski/x-GGUF", "hf.co/bartowski/x-GGUF:latest"),
+        ("registry.local:5000/foo", "registry.local:5000/foo:latest"),
+        ("registry.local:5000/foo:1b", "registry.local:5000/foo:1b"),
+    ],
+)
+def test_canonical_model_appends_latest_only_when_the_last_path_part_has_no_tag(
+    name: str, canonical: str
+) -> None:
+    assert canonical_model(name) == canonical
+
+
+def test_read_host_names_models_as_ollama_does_and_matches_untagged_requests_to_them() -> None:
+    model_info = {"model_info": LLAMA_INFO}
+    tags = {
+        "models": [{"name": "nomic-embed-text:latest", "size": 1}, {"name": "d:24b", "size": 2}]
+    }
+    ps = {"models": [{"name": "nomic-embed-text:latest", "size_vram": 3, "size": 4}]}
+    recorder = Recorder(
+        {"/api/tags": tags, "/api/ps": ps},
+        show={"nomic-embed-text": model_info, "d:24b": model_info},
+    )
+    state = read_host(workstation(), recorder, ["nomic-embed-text", "d:24b"])
+    assert state.sizes == {"nomic-embed-text:latest": 1, "d:24b": 2}
+    assert (state.resident, state.loaded) == (
+        {"nomic-embed-text:latest": 3},
+        {"nomic-embed-text:latest": 4},
+    )
+    assert state.kv == {"nomic-embed-text:latest": LLAMA_SHAPE, "d:24b": LLAMA_SHAPE}
 
 
 class Answer(io.BytesIO):

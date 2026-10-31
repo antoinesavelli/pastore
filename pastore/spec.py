@@ -130,6 +130,11 @@ class TaskSpec:
         return f"{self.consumer}/{self.id}"
 
 
+def canonical_model(name: str) -> str:
+    """Ollama's name for a model: `:latest` is implied when the part after the last `/` has no tag."""
+    return name if ":" in name.rsplit("/", 1)[-1] else f"{name}:latest"
+
+
 def idle_reason(reason: str, detail: str = "") -> str:
     """Format an idle reason, refusing anything outside the closed list."""
     if reason not in IDLE_REASONS:

@@ -1,6 +1,6 @@
 """Per-host model facts (/api/tags, /api/ps, /api/show) and the executor health probe, read each tick by the dispatcher.
 
-Depends on: pastore.spec (Host, WORKSTATION, idle_reason); stdlib urllib and json; the HTTP call is injected.
+Depends on: pastore.spec (Host, WORKSTATION, canonical_model, idle_reason); stdlib urllib and json; the HTTP call is injected.
 """
 
 import http.client
@@ -10,7 +10,7 @@ import urllib.request
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field
 
-from pastore.spec import WORKSTATION, Host, idle_reason
+from pastore.spec import WORKSTATION, Host, canonical_model, idle_reason
 
 HttpJson = Callable[[str, Mapping[str, object] | None, float], object]
 PROBE_TIMEOUT_S = 2.0
@@ -108,7 +108,7 @@ def _entry(
                 f"{host.name}: {path} lists {name!r} without a non-negative integer {key}"
             )
         values[key] = value
-    return name, values
+    return canonical_model(name), values
 
 
 def _listing(
@@ -127,13 +127,13 @@ def _listing(
 
 
 def model_sizes(host: Host, get: HttpJson) -> dict[str, int]:
-    """/api/tags as model name -> size bytes."""
+    """/api/tags as canonical model name -> size bytes."""
     rows = _listing(host, get, "/api/tags", ("size",))
     return {name: values["size"] for name, values in rows.items()}
 
 
 def ps_sizes(host: Host, get: HttpJson) -> tuple[dict[str, int], dict[str, int]]:
-    """/api/ps as (model name -> size_vram bytes, model name -> size bytes), from one request."""
+    """/api/ps as (canonical name -> size_vram bytes, canonical name -> size bytes), from one request."""
     rows = _listing(host, get, "/api/ps", ("size_vram", "size"))
     return (
         {name: values["size_vram"] for name, values in rows.items()},
@@ -175,7 +175,7 @@ def kv_shape(host: Host, model: str, get: HttpJson) -> KvShape | None:
 
 
 def read_host(host: Host, get: HttpJson, models: Collection[str]) -> HostState:
-    """The host's health and model facts, KV shapes for the `models` it has; an unreadable host takes no new run."""
+    """The host's health and model facts by canonical name, KV shapes for the `models` it has; an unreadable host takes no new run."""
     local = host.name == WORKSTATION
     if not local:
         down = executor_reason(host, get)
@@ -184,7 +184,8 @@ def read_host(host: Host, get: HttpJson, models: Collection[str]) -> HostState:
     try:
         sizes = model_sizes(host, get)
         resident, loaded = ps_sizes(host, get)
-        kv = {name: kv_shape(host, name, get) for name in dict.fromkeys(models) if name in sizes}
+        names = dict.fromkeys(canonical_model(model) for model in models)
+        kv = {name: kv_shape(host, name, get) for name in names if name in sizes}
     except (OSError, ValueError, HostError):
         return HostState(host, idle_reason("ollama-down" if local else "executor-down"), {}, {})
     return HostState(host, None, sizes, resident, loaded, kv)

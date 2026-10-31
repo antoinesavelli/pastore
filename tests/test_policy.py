@@ -5,6 +5,7 @@ Depends on: pastore.policy, pastore.spec and pytest only.
 
 import copy
 import hashlib
+import re
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -147,7 +148,7 @@ def test_two_models_of_one_task_are_two_pairs() -> None:
     ]
 
 
-def test_repo_policy_v2_loads_and_round_trips_byte_for_byte() -> None:
+def test_repo_policy_loads_and_round_trips_byte_for_byte() -> None:
     policy = load_policy(REPO_POLICY)
     assert policy.hosts == {
         "workstation": Host("workstation", "http://127.0.0.1:11435", 24, 1, 1, 32768),
@@ -162,7 +163,9 @@ def test_repo_policy_v2_loads_and_round_trips_byte_for_byte() -> None:
         SourceRule(Level.ROUTINE, "cgroup", ("*.service", "*.scope"), ("session-*.scope",)),
     )
     assert set(policy.consumers) == {"memory", "torra"}
-    assert policy.jobs == ()
+    assert all(pair.task.split("/", 1)[0] in policy.consumers for pair in policy.jobs)
+    assert len({(pair.task, pair.model) for pair in policy.jobs}) == len(policy.jobs)
+    assert all(re.fullmatch("[0-9a-f]{64}", pair.sha256) for pair in policy.jobs)
     assert render_policy(policy) == REPO_POLICY.read_text()
 
 
