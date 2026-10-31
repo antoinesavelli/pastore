@@ -389,12 +389,12 @@ class PolicyCache:
         except OSError as exc:
             data, error = f"unreadable: {exc}".encode(), PolicyError(f"cannot read: {exc}")
         if data != self._seen:
-            self._seen = data
             if error is None:
                 error = self._try_parse(data)
             self._error = error
             if error is not None:
                 self._log(f"policy error in {self._path}: {error}")
+            self._seen = data  # last: an interrupted read is repeated, never taken as seen
         if self._good is None:
             raise self._error or PolicyError("no policy loaded")
         return self._good

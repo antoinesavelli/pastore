@@ -1,16 +1,19 @@
-"""A running job (`Active`) and the reads that explain how its run ended: the kernel log's OOM kill (R34) and the gateway's outage (D-050 (4)).
+"""A running job (`Active`), the reads that explain how its run ended (the kernel log's OOM kill, R34; the gateway's outage, D-050 (4)) and the crash charge (D-012).
 
-Depends on: contract (Started), hosts (HttpJson, PROBE_TIMEOUT_S), runner (RunDir, Runner), spec (TaskSpec).
+Depends on: contract (Started), hosts (HttpJson, PROBE_TIMEOUT_S), runner (RunDir, Runner), spec (TaskSpec), state (JobRow).
 """
 
 import urllib.error
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 
 from pastore.contract import Started
 from pastore.hosts import PROBE_TIMEOUT_S, HttpJson
 from pastore.runner import RunDir, Runner
 from pastore.spec import TaskSpec
+from pastore.state import JobRow
+
+MAX_ATTEMPTS = 3
 
 
 @dataclass(frozen=True)
@@ -71,3 +74,10 @@ def gateway_outage(get: HttpJson, status_url: str, since: datetime) -> bool:
     except ValueError:
         return False
     return restarted.tzinfo is not None and restarted > since
+
+
+def charge_crash(job: JobRow) -> JobRow:
+    streak = job.crash_streak + 1
+    attempts = job.attempts + (1 if streak >= 2 else 0)
+    status = "failed" if attempts >= MAX_ATTEMPTS else "pending"
+    return replace(job, crash_streak=streak, attempts=attempts, status=status)

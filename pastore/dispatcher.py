@@ -1,6 +1,6 @@
 """The fleet dispatcher: each tick heartbeats, honours stop and run-now requests, watches every running job, places the ready ones, and records any foreign workload disruption that overlaps an executor run (R35); a tick is bounded at 60 s (D-050 (6)).
 
-Depends on: policy (PolicyCache), manifest, state (State, rows, lock), checks (Host), hosts (read_host), placement (place), runner, run_end (Active, gateway_outage, oom_killed), tick_bound, contract (Started), spec, workload_watch.
+Depends on: policy (PolicyCache), manifest, state (State, rows, lock), checks (Host), hosts (read_host), placement (place), runner, run_end (Active, charge_crash, gateway_outage, oom_killed), tick_bound, contract (Started), spec, workload_watch.
 """
 
 import math
@@ -21,7 +21,7 @@ from pastore.hosts import HostState, HttpJson, executor_reason, read_host
 from pastore.manifest import ManifestError
 from pastore.placement import HostLoad, ModelFacts, kv_bytes_per_slot, place
 from pastore.policy import Policy, PolicyCache
-from pastore.run_end import Active, NoHandle, gateway_outage, oom_killed
+from pastore.run_end import MAX_ATTEMPTS, Active, NoHandle, charge_crash, gateway_outage, oom_killed
 from pastore.runner import RunDir, fresh_run_dir, stop_leftovers
 from pastore.spec import (
     BASE_ENV_KEYS,
@@ -35,7 +35,6 @@ from pastore.spec import (
 from pastore.state import DispatcherLock, JobRow, RunRow, State, StatePaths, open_state
 from pastore.tick_bound import TICK_BOUND_S, CriticalSections, bounded
 
-MAX_ATTEMPTS = 3
 STARVED_AFTER = timedelta(hours=24)
 TICK_S = 30.0
 
@@ -86,7 +85,7 @@ class Dispatcher(CriticalSections):
             self.state.update_run(replace(run, status="crashed", ended_at=iso(now)))
             job = self.state.get_job(run.ref, run.model)
             if job is not None:
-                self.state.upsert_job(_charge_crash(job))
+                self.state.upsert_job(charge_crash(job))
         for job in self.state.jobs_with_status("running"):
             if (job.ref, job.model) not in crashed:
                 self.state.upsert_job(replace(job, status="pending"))
@@ -258,7 +257,7 @@ class Dispatcher(CriticalSections):
             reason = _unplaced_reason(states)
             placed = self._place_all(now, self._loads(states), ready, forced, reason)
         elif forced is not None:
-            self._refuse_run_now(now, forced, reason)
+            self._refuse_run_now(now, forced[0].ref, forced[1], reason)
         if placed or self.active:
             self.state.clear_idle_reason()
         else:
@@ -270,20 +269,26 @@ class Dispatcher(CriticalSections):
         return [u for u in units if (u[0].ref, u[1]) not in running]
 
     def _run_now(self, now: datetime, units: list[Unit]) -> Unit | None:
+        """The requested pair if it is listed and pending; the request stays until it is acted on, so an overrun cannot lose it."""
         key = self.state.run_now_requested()
         if key is None:
             return None
-        self.state.clear_run_now()
         match = [u for u in units if (u[0].ref, u[1]) == key and self._job(*u).status == "pending"]
         if not match:
-            detail = (
-                f"{key[1]}: run-now: not listed, no contract pass, or not pending (use rerun first)"
+            self._refuse_run_now(
+                now, *key, "not listed, no contract pass, or not pending (use rerun first)"
             )
-            self.state.record_event(now, "refused", key[0], detail)
         return match[0] if match else None
 
-    def _refuse_run_now(self, now: datetime, unit: Unit, reason: str) -> None:
-        self.state.record_event(now, "refused", unit[0].ref, f"{unit[1]}: run-now: {reason}")
+    def _refuse_run_now(self, now: datetime, ref: str, model: str, reason: str) -> None:
+        with self._critical():
+            self.state.record_event(now, "refused", ref, f"{model}: run-now: {reason}")
+            self._clear_run_now(ref, model)
+
+    def _clear_run_now(self, ref: str, model: str) -> None:
+        """Drop the run-now request once it is acted on, unless a request for another pair has replaced it."""
+        if self.state.run_now_requested() == (ref, model):
+            self.state.clear_run_now()
 
     def _gate(self, ready: list[Unit]) -> str | None:
         """The idle reason that keeps every ready unit waiting, or None when placement may go on."""
@@ -341,10 +346,14 @@ class Dispatcher(CriticalSections):
             host = place(model, loads)
             if host is None:
                 if unit is forced:
-                    self._refuse_run_now(now, unit, reason)
+                    self._refuse_run_now(now, unit[0].ref, unit[1], reason)
                 continue
             attempted += 1
-            if self._start(now, *unit, host):
+            with self._critical():
+                started = self._start(now, *unit, host)
+                if unit is forced:
+                    self._clear_run_now(unit[0].ref, unit[1])
+            if started:
                 _hold(loads, host, model)
         return attempted
 
@@ -375,8 +384,8 @@ class Dispatcher(CriticalSections):
 
     def _refuse(self, now: datetime, ref: str, detail: str) -> None:
         if (ref, detail) not in self._refused:
-            self._refused.add((ref, detail))
             self.state.record_event(now, "refused", ref, detail)
+            self._refused.add((ref, detail))
 
     def _job(self, spec: TaskSpec, model: str) -> JobRow:
         job = self.state.get_job(spec.ref, model)
@@ -422,9 +431,9 @@ class Dispatcher(CriticalSections):
         if job.ready_since is None or job.starved_flagged:
             return
         if now - datetime.fromisoformat(job.ready_since) > STARVED_AFTER:
-            self.state.upsert_job(replace(job, starved_flagged=1))
             detail = f"{job.model}: ready since {job.ready_since}"
             self.state.record_event(now, "starved", job.ref, detail)
+            self.state.upsert_job(replace(job, starved_flagged=1))
 
     def _start(self, now: datetime, spec: TaskSpec, model: str, host: str) -> bool:
         with self._critical():
@@ -465,13 +474,6 @@ def _hold(loads: list[HostLoad], host: str, model: str) -> None:
     loads[index] = replace(loads[index], held=(*loads[index].held, model))
 
 
-def _charge_crash(job: JobRow) -> JobRow:
-    streak = job.crash_streak + 1
-    attempts = job.attempts + (1 if streak >= 2 else 0)
-    status = "failed" if attempts >= MAX_ATTEMPTS else "pending"
-    return replace(job, crash_streak=streak, attempts=attempts, status=status)
-
-
 def serve(
     deps: Deps,
     policy_path: Path,
@@ -499,15 +501,14 @@ def serve(
 
         previous = signal.signal(signal.SIGTERM, on_sigterm)
         previous_alarm = signal.signal(signal.SIGALRM, on_sigalrm)
-        stale = [state.stop_requested(), state.run_now_requested()]
-        state.clear_stop()
-        state.clear_run_now()
-        dispatcher.recover(clock())
-        dropped = [r for r in stale if r is not None]
-        state.record_event(
-            clock(), "dispatcher-start", detail=f"dropped stale {dropped}" if dropped else ""
-        )
         try:
+            stale = [state.stop_requested(), state.run_now_requested()]
+            state.clear_stop()
+            state.clear_run_now()
+            dispatcher.recover(clock())
+            dropped = [r for r in stale if r is not None]
+            detail = f"dropped stale {dropped}" if dropped else ""
+            state.record_event(clock(), "dispatcher-start", detail=detail)
             while _guarded_tick(dispatcher, state, clock, tick_bound_s):
                 _nap(dispatcher, sleep, tick_s)
         finally:
