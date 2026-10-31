@@ -590,6 +590,7 @@ def test_cpu_times_total_and_idle_use_the_first_eight_fields(sx: ModuleType) -> 
     assert sx._cpu_times(["cpu0 1 2 3 4 5 6 7 8"]) is None
     assert sx._cpu_times(["cpu  1 2 x 4 5 6"]) is None
     assert sx._cpu_times(["cpu  1 2 3 4 5 6 7 x"]) is None  # all eight fields must be digits
+    assert sx._cpu_times(["cpu  1 2 3 4 5", "cpu0 9 9 9 9 9"]) == (15.0, 9.0)  # the first line only
     assert sx._cpu_times([]) is None
 
 
