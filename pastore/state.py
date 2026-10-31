@@ -27,6 +27,7 @@ DISPATCHER_EVENTS = (
     "tick-error",
     "workload-overlap",
     "workload-ack",
+    "runs-pruned",
 )
 SCHEMA = """
 CREATE TABLE jobs(
@@ -313,6 +314,14 @@ class State:
             (ref, model),
         )
         return None if row is None else RunRow(*row)
+
+    def latest_run_ids(self) -> set[str]:
+        """The run id of the most recently started run of every task and model pair that has one."""
+        rows = self._conn.execute(
+            "SELECT run_id FROM runs r WHERE run_id = (SELECT run_id FROM runs "
+            "WHERE ref=r.ref AND model=r.model ORDER BY started_at DESC, run_id DESC LIMIT 1)"
+        )
+        return {row[0] for row in rows}
 
     def jobs_with_status(self, status: str) -> list[JobRow]:
         """Every job in this status, ordered by ref, then model."""

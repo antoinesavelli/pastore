@@ -1,19 +1,22 @@
-"""Run directories, the `systemd-run --user` scope, the job environment, stop, and leftover-scope recovery.
+"""Run directories and their retention pruning, the `systemd-run --user` scope, the job environment, stop, and leftover-scope recovery.
 
 Depends on: pastore.spec (TaskSpec); every systemctl call goes through an injected `run` callable.
 """
 
 import re
+import shutil
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Protocol
 
 from pastore.spec import BASE_ENV_KEYS, RUN_DIR_ENV, TaskSpec
 
 _SCOPE_NAME = re.compile(r"^pastore-.+\.scope$")
+_RUN_STAMP = re.compile(r"^(\d{8}T\d{6})-")
+RUN_DIR_MAX_AGE = timedelta(days=30)
 Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 
 
@@ -58,6 +61,31 @@ def make_run_dir(runs_dir: Path, run_id: str) -> RunDir:
     out = root / "out"
     out.mkdir()
     return RunDir(root=root, out=out, stdout=root / "stdout.log", stderr=root / "stderr.log")
+
+
+def prune_run_dirs(
+    runs_dir: Path, keep: set[str], now: datetime, max_age: timedelta = RUN_DIR_MAX_AGE
+) -> list[str]:
+    """Delete run folders stamped more than `max_age` before `now` and not in `keep`; the sorted names deleted."""
+    if not runs_dir.is_dir():
+        return []
+    deleted = []
+    for child in runs_dir.iterdir():
+        stamp = _RUN_STAMP.match(child.name)
+        if stamp is None or child.name in keep or child.is_symlink() or not child.is_dir():
+            continue
+        try:
+            started = datetime.strptime(stamp[1], "%Y%m%dT%H%M%S").replace(tzinfo=UTC)
+        except ValueError:
+            continue
+        if now - started <= max_age:
+            continue
+        try:
+            shutil.rmtree(child)
+        except OSError:
+            continue
+        deleted.append(child.name)
+    return sorted(deleted)
 
 
 def job_env(
