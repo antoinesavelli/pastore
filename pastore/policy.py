@@ -345,7 +345,8 @@ def parse_policy(text: str) -> Policy:
     """Validate policy text; raise PolicyError listing every problem found."""
     try:
         data = yaml.load(text, Loader=_UniqueKeyLoader)
-    except yaml.YAMLError as exc:
+    # RecursionError: nested too deep. ValueError: an int over 4300 digits. Neither may stall the dispatcher's tick.
+    except (yaml.YAMLError, RecursionError, ValueError) as exc:
         raise PolicyError(f"invalid YAML: {exc}") from exc
     if not isinstance(data, dict):
         raise PolicyError("policy must be a mapping with version, hosts, sources, consumers, jobs")

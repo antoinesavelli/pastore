@@ -401,6 +401,42 @@ def test_run_now_round_trips_a_pair_and_clears(paths: StatePaths) -> None:
     state.close()
 
 
+def test_clear_run_now_with_an_expected_pair_drops_only_that_request(paths: StatePaths) -> None:
+    state, other = open_state(paths), open_state(paths)
+    state.request_run_now(REF, "m-a")
+    state.clear_run_now((REF, "m-b"))
+    assert state.run_now_requested() == (REF, "m-a")
+    other.request_run_now(REF, "m-b")  # a second connection replaced the request
+    state.clear_run_now((REF, "m-a"))
+    assert state.run_now_requested() == (REF, "m-b")
+    state.clear_run_now((REF, "m-b"))
+    assert state.run_now_requested() is None
+    state.clear_run_now((REF, "m-b"))  # nothing pending is fine
+    odd = ('torra/é"x\\y', "m:1")
+    state.request_run_now(*odd)
+    state.clear_run_now(odd)  # the same JSON encoding the request used
+    assert state.run_now_requested() is None
+    state.close()
+    other.close()
+
+
+def test_clear_run_now_with_an_expected_pair_is_one_conditional_statement(
+    paths: StatePaths,
+) -> None:
+    state = open_state(paths)
+    state.request_run_now(REF, "m-a")
+    statements: list[str] = []
+    state._conn.set_trace_callback(statements.append)
+    state.clear_run_now((REF, "m-a"))
+    state._conn.set_trace_callback(None)
+    deletes = [s for s in statements if s.startswith("DELETE")]
+    assert len(deletes) == 1 and "value=" in deletes[0]
+    assert not [
+        s for s in statements if s.startswith("SELECT")
+    ]  # no read the request could change after
+    state.close()
+
+
 @pytest.mark.parametrize(
     "stored",
     [REF, "not json{", '["a"]', '["a", "b", "c"]', '["a", 1]', '{"a": "b"}', "null", '"ab"'],

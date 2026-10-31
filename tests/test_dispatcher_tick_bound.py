@@ -18,9 +18,10 @@ from pastore import dispatcher as dispatcher_module
 from pastore import policy as policy_module
 from pastore.checks import Host
 from pastore.dispatcher import Dispatcher, serve
-from pastore.policy import PolicyCache
+from pastore.policy import PolicyCache, PolicyError, parse_policy
 from pastore.runner import RunDir
 from pastore.spec import Ready, TaskSpec
+from pastore.state import open_state
 from pastore.tick_bound import TickOverrun
 from tests.test_dispatcher import MODEL, FakeHandle, FakeNet, Rig, host, task
 from tests.test_dispatcher_gateway_outage import Gateway, not_a_gateway
@@ -496,11 +497,16 @@ def test_an_overrun_after_the_run_now_was_read_keeps_the_request_and_the_next_ti
     drive.run(on_nap)
 
 
-def test_a_newer_run_now_for_another_pair_survives_the_start_of_the_first(tmp_path: Path) -> None:
+def test_a_newer_run_now_for_another_pair_survives_the_start_of_the_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     def newer_request(
         argv: Sequence[str], cwd: Path, env: Mapping[str, str]
     ) -> CompletedProcess[str]:
-        rig.state.request_run_now("c/b", MODEL)  # arrives while the tick is under way
+        with contextlib.closing(
+            open_state(rig.paths)
+        ) as other:  # a second connection, as the CLI is
+            other.request_run_now("c/b", MODEL)  # arrives while the tick is under way
         return CompletedProcess(list(argv), 1, "", "")
 
     specs = [
@@ -508,6 +514,14 @@ def test_a_newer_run_now_for_another_pair_survives_the_start_of_the_first(tmp_pa
         task(tmp_path, "b", ready=Ready(3600, ("./ready",))),
     ]
     rig = rig_with(tmp_path, specs, run_in=newer_request)
+    clears: list[object] = []
+    real_clear = rig.state.clear_run_now
+
+    def spy(expected: tuple[str, str] | None = None) -> None:
+        clears.append(expected)
+        real_clear(expected)
+
+    monkeypatch.setattr(rig.state, "clear_run_now", spy)
     rig.state.request_run_now("c/a", MODEL)
     rig.tick()
     assert [e.ref for e in rig.events("run-start")] == ["c/a"]
@@ -515,6 +529,68 @@ def test_a_newer_run_now_for_another_pair_survives_the_start_of_the_first(tmp_pa
     rig.tick()
     assert [e.ref for e in reversed(rig.events("run-start"))] == ["c/a", "c/b"]
     assert rig.state.run_now_requested() is None
+    assert clears == [("c/a", MODEL), ("c/b", MODEL)]  # each clear names the pair it acted on
+
+
+def test_a_forced_start_that_outlives_the_bound_still_clears_the_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def slow_start(
+        spec: TaskSpec, run_dir: RunDir, run_id: str, url: str, model: str, env: Mapping[str, str]
+    ) -> FakeHandle:
+        time.sleep(LATE_S)
+        return rig.start(spec, run_dir, run_id, url, model, env)
+
+    spec = task(tmp_path, "a", ready=Ready(3600, ("./ready",)))
+    rig = rig_with(tmp_path, [spec], run_in=Blocker(rc=1), start=slow_start)
+    rig.next_codes = [None]
+    drive = Drive(rig, monkeypatch)
+
+    def on_nap(n: int) -> None:
+        if n == 1:
+            rig.state.request_run_now("c/a", MODEL)
+        elif (
+            n == 2
+        ):  # the forced start outlived the bound, so the overrun came at the end of its critical section
+            assert drive.overruns() == ["TickOverrun: tick ran past 0.3 s"]
+            assert rig.state.run_now_requested() is None and len(rig.handles) == 1
+            assert rig.events("refused") == [] and len(rig.state.runs_with_status("running")) == 1
+        else:  # the next tick did not read the request again and refuse the pair that now runs
+            assert rig.events("refused") == [] and len(rig.handles) == 1
+            rig.state.request_stop("now")
+
+    drive.run(on_nap)
+
+
+PATHOLOGICAL = {
+    "nested-too-deep": "version: 2\nhosts: " + "[" * 3000 + "]" * 3000 + "\n",
+    "int-over-4300-digits": "version: 2\nsize: " + "9" * 5000 + "\n",
+}
+
+
+@pytest.mark.parametrize("text", PATHOLOGICAL.values(), ids=PATHOLOGICAL)
+def test_a_pathological_policy_is_a_policy_error(text: str) -> None:
+    with pytest.raises(PolicyError, match="invalid YAML"):
+        parse_policy(text)
+
+
+@pytest.mark.parametrize("text", PATHOLOGICAL.values(), ids=PATHOLOGICAL)
+def test_a_pathological_policy_neither_stalls_the_tick_nor_loses_the_last_good_policy(
+    tmp_path: Path, text: str
+) -> None:
+    rig = rig_with(tmp_path, [task(tmp_path, "a")])
+    logged: list[str] = []
+    rig.d.policy = PolicyCache(rig.policy, logged.append)
+    rig.next_codes = [None]
+    rig.tick()
+    good = rig.d.policy.current()
+    assert len(rig.handles) == 1 and logged == []
+    rig.policy.write_text(text)
+    rig.state.request_stop("now")
+    assert rig.tick() is False  # the stop is honoured on the first tick after the bad edit
+    assert rig.handles[0].stopped and rig.d.active == {}
+    assert rig.d.policy.current() is good and rig.d.policy.current() is good
+    assert len(logged) == 1 and logged[0].startswith("policy error in ")
 
 
 class CutOnce:

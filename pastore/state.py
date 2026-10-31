@@ -427,10 +427,16 @@ class State:
             raise StateError(f"meta run_now is not a [ref, model] JSON list: {raw!r}")
         return pair[0], pair[1]
 
-    def clear_run_now(self) -> None:
-        """Drop any pending run-now request."""
+    def clear_run_now(self, expected: tuple[str, str] | None = None) -> None:
+        """Drop the pending run-now request; with `expected`, only if it is still that (ref, model), in one statement."""
         with self._conn:
-            self._conn.execute("DELETE FROM meta WHERE key='run_now'")
+            if expected is None:
+                self._conn.execute("DELETE FROM meta WHERE key='run_now'")
+            else:
+                self._conn.execute(
+                    "DELETE FROM meta WHERE key='run_now' AND value=?",
+                    (json.dumps(list(expected)),),
+                )
 
     def reset_crash_streaks(self, except_keys: set[tuple[str, str]]) -> None:
         """Zero the crash streak of every job (ref, model) not running at this crash (D-012: only consecutive crashes count)."""

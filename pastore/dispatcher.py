@@ -283,12 +283,7 @@ class Dispatcher(CriticalSections):
     def _refuse_run_now(self, now: datetime, ref: str, model: str, reason: str) -> None:
         with self._critical():
             self.state.record_event(now, "refused", ref, f"{model}: run-now: {reason}")
-            self._clear_run_now(ref, model)
-
-    def _clear_run_now(self, ref: str, model: str) -> None:
-        """Drop the run-now request once it is acted on, unless a request for another pair has replaced it."""
-        if self.state.run_now_requested() == (ref, model):
-            self.state.clear_run_now()
+            self.state.clear_run_now((ref, model))
 
     def _gate(self, ready: list[Unit]) -> str | None:
         """The idle reason that keeps every ready unit waiting, or None when placement may go on."""
@@ -352,7 +347,7 @@ class Dispatcher(CriticalSections):
             with self._critical():
                 started = self._start(now, *unit, host)
                 if unit is forced:
-                    self._clear_run_now(unit[0].ref, unit[1])
+                    self.state.clear_run_now((unit[0].ref, unit[1]))
             if started:
                 _hold(loads, host, model)
         return attempted
