@@ -1,19 +1,23 @@
-"""Pins the CLI surface: the add gate (model, evidence, contract), remove, status, stop, check, rerun/ack/reset, run-now and contract gates, start wiring.
+"""Pins the CLI surface: the add gate (model, evidence, contract), remove, status (state lines and the gateway read), stop, check, rerun/ack/reset, run-now and contract gates, start wiring.
 
-Depends on: pastore.cli, pastore.dispatcher (Deps), pastore.policy, pastore.spec (Pair), pastore.state, pastore.manifest, tests.fakes.
+Depends on: pastore.cli, pastore.dispatcher (Deps), pastore.hosts (HttpJson), pastore.policy, pastore.spec (Pair), pastore.state, pastore.manifest, tests.fakes; the gateway is always an injected HttpJson, never 127.0.0.1:11434.
 """
 
 import hashlib
 import io
+import json
 import os
 import stat
 import sys
-from datetime import UTC, datetime
+import urllib.error
+from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
+from email.message import Message
 from pathlib import Path
 
 import pytest
 
-from pastore import cli
+from pastore import cli, hosts
 from pastore.cli import _run_in, main
 from pastore.dispatcher import Deps
 from pastore.manifest import load_manifest
@@ -27,6 +31,17 @@ MODEL = "qwen3:8b"
 OTHER = "gemma3:4b"
 EVIDENCE = b"qwen3:8b passes bench on the owner's holdout\n"
 FAKE_SHA = "0" * 64
+GATEWAY_URL = "http://127.0.0.1:11434/pastore/status"
+LEVELS = ("reins", "webui", "coding", "corsu", "routine", "hearth")
+REFUSED = "gateway: not answering ([Errno 111] Connection refused)"
+WORKSTATION_LINE = (
+    "gateway workstation: slots=1 in_flight=1 "
+    "queued reins=0 webui=0 coding=1 corsu=0 routine=0 hearth=2 oldest_wait_s=12.4"
+)
+EXECUTOR_LINE = (
+    "gateway executor: slots=9 in_flight=0 "
+    "queued reins=0 webui=0 coding=0 corsu=0 routine=0 hearth=0 oldest_wait_s=none"
+)
 TASK = """  - id: bench
     kind: eval
     argv: [.venv/bin/python, -m, bench]
@@ -38,6 +53,51 @@ TASK = """  - id: bench
     model_env: BENCH_MODEL
     reader: {run: [.venv/bin/python, read.py]}
 """
+
+
+class Gateway:
+    """An injected HttpJson: returns `answer`, or raises it when it is an exception; records every call."""
+
+    def __init__(self, answer: object) -> None:
+        self.answer = answer
+        self.calls: list[tuple[str, Mapping[str, object] | None, float]] = []
+
+    def __call__(self, url: str, body: Mapping[str, object] | None, timeout_s: float) -> object:
+        self.calls.append((url, body, timeout_s))
+        if isinstance(self.answer, Exception):
+            raise self.answer
+        return self.answer
+
+
+def host_entry(**changes: object) -> dict[str, object]:
+    """A valid /pastore/status host entry (idle, nothing queued) with these keys replaced."""
+    entry: dict[str, object] = {
+        "slots": 1,
+        "in_flight": 0,
+        "queued": dict.fromkeys(LEVELS, 0),
+        "oldest_wait_s": None,
+    }
+    return entry | changes
+
+
+def without(entry: dict[str, object], key: str) -> dict[str, object]:
+    return {k: v for k, v in entry.items() if k != key}
+
+
+def hosts_answer(**entries: object) -> dict[str, object]:
+    return {"hosts": entries}
+
+
+def two_hosts() -> dict[str, object]:
+    """The Phase 3a example answer."""
+    return hosts_answer(
+        workstation=host_entry(
+            in_flight=1,
+            queued={**dict.fromkeys(LEVELS, 0), "coding": 1, "hearth": 2},
+            oldest_wait_s=12.4,
+        ),
+        executor=host_entry(slots=9),
+    )
 
 
 class Env:
@@ -56,6 +116,7 @@ class Env:
         self.write_policy()
         self.paths = default_paths(self.home)
         self.clock = FakeClock(T0)
+        self.gateway = Gateway(ConnectionRefusedError(111, "Connection refused"))
 
     def write_policy(self, *listed: tuple[str, str]) -> None:
         """Write a valid v2 policy listing these (task, model) pairs in order."""
@@ -66,7 +127,7 @@ class Env:
         self.policy.write_text(
             "version: 2\n"
             "hosts:\n"
-            '  workstation: {url: "http://127.0.0.1:11435", vram_gb: 24, max_models: 3, parallel: 3}\n'
+            '  workstation: {url: "http://127.0.0.1:11435", vram_gb: 24, max_models: 3, parallel: 3, context: 32768}\n'
             "sources:\n"
             '  - {level: hearth, cgroup: ["pastore-*.scope"]}\n'
             f"consumers:\n  torra: {self.manifest}\n"
@@ -82,6 +143,7 @@ class Env:
             clock=self.clock,
             out=out,
             stdin_isatty=lambda: tty,
+            http_json=self.gateway,
         )
         return code, out.getvalue()
 
@@ -237,7 +299,7 @@ def test_remove_needs_no_contract_and_refuses_an_unlisted_pair(
 
 
 def test_status_without_state_is_not_an_error(env: Env) -> None:
-    assert env.run("status") == (0, "no state yet\n")
+    assert env.run("status") == (0, f"no state yet\n{REFUSED}\n")
     assert not env.paths.state_dir.exists()
 
 
@@ -268,7 +330,10 @@ def test_status_reports_dispatcher_jobs_and_reviews(env: Env) -> None:
         assert "dispatcher: dispatcher-down" in stale
     state.close()
     assert "idle: no-ready-task" in out
-    assert "torra/bench qwen3:8b: pending attempts=1 last_run=awaiting-review starved" in out
+    assert (
+        "torra/bench qwen3:8b: pending attempts=1 last_run=awaiting-review host=workstation starved"
+        in out
+    )
     assert "awaiting review: r1 (torra/bench qwen3:8b)" in out
 
 
@@ -291,7 +356,7 @@ def test_status_last_run_is_per_model(env: Env) -> None:
     state.insert_run(RunRow("r1", "torra/bench", MODEL, "workstation", "fp", "done", "t"))
     state.close()
     lines = env.run("status")[1].splitlines()
-    assert "torra/bench qwen3:8b: unseen attempts=0 last_run=done" in lines
+    assert "torra/bench qwen3:8b: unseen attempts=0 last_run=done host=workstation" in lines
     assert "torra/bench gemma3:4b: unseen attempts=0 last_run=none" in lines
 
 
@@ -300,6 +365,306 @@ def test_status_works_while_a_writer_holds_the_db(env: Env) -> None:
     state.heartbeat(T0)
     assert env.run("status")[0] == 0
     state.close()
+
+
+def test_status_shows_only_the_newest_tick_error(env: Env) -> None:
+    env.write_policy()
+    state = open_state(env.paths)
+    assert "tick-error" not in env.run("status")[1]
+    state.record_event(T0, "tick-error", detail="first")
+    state.record_event(T0 + timedelta(seconds=1), "tick-error", detail="second")
+    state.close()
+    lines = env.run("status")[1].splitlines()
+    assert lines[2] == "last tick-error: 2026-10-25T03:00:01+00:00 second"
+    assert sum("tick-error" in line for line in lines) == 1
+
+
+def test_status_shows_the_host_of_the_last_run_on_each_pair_line(env: Env) -> None:
+    env.write_policy(("torra/bench", MODEL), ("torra/bench", OTHER))
+    state = open_state(env.paths)
+    state.insert_run(RunRow("r1", "torra/bench", MODEL, "workstation", "fp", "failed", "t1"))
+    state.insert_run(RunRow("r2", "torra/bench", MODEL, "executor", "fp", "done", "t2"))
+    state.insert_run(RunRow("r3", "torra/bench", OTHER, "workstation", "fp", "done", "t3"))
+    state.close()
+    lines = env.run("status")[1].splitlines()
+    assert "torra/bench qwen3:8b: unseen attempts=0 last_run=done host=executor" in lines
+    assert "torra/bench gemma3:4b: unseen attempts=0 last_run=done host=workstation" in lines
+
+
+def test_status_lists_running_and_awaiting_review_runs_before_the_gateway(env: Env) -> None:
+    env.write_policy(("torra/bench", MODEL), ("torra/bench", OTHER))
+    env.gateway.answer = two_hosts()
+    state = open_state(env.paths)
+    state.upsert_job(JobRow("torra/bench", MODEL, "fp", "running", attempts=1))
+    state.insert_run(
+        RunRow("r1", "torra/bench", OTHER, "workstation", "fp", "awaiting-review", "t1")
+    )
+    state.insert_run(RunRow("r2", "torra/bench", MODEL, "executor", "fp", "running", "t2"))
+    state.close()
+    assert env.run("status") == (
+        0,
+        "dispatcher: dispatcher-down\n"
+        "idle: none\n"
+        "torra/bench qwen3:8b: running attempts=1 last_run=running host=executor\n"
+        "torra/bench gemma3:4b: unseen attempts=0 last_run=awaiting-review host=workstation\n"
+        "awaiting review: r1 (torra/bench gemma3:4b)\n"
+        "running: r2 (torra/bench qwen3:8b on executor)\n"
+        f"{WORKSTATION_LINE}\n{EXECUTOR_LINE}\n",
+    )
+
+
+def test_status_prints_one_gateway_line_per_host_from_the_status_endpoint(env: Env) -> None:
+    env.write_policy(("torra/bench", MODEL))
+    open_state(env.paths).close()
+    env.gateway.answer = two_hosts()
+    code, out = env.run("status")
+    assert code == 0 and out.splitlines()[-2:] == [WORKSTATION_LINE, EXECUTOR_LINE]
+    assert env.gateway.calls == [(GATEWAY_URL, None, 2.0)]
+
+
+def test_status_prints_the_gateway_lines_even_with_no_state_yet(env: Env) -> None:
+    env.gateway.answer = two_hosts()
+    assert env.run("status") == (0, f"no state yet\n{WORKSTATION_LINE}\n{EXECUTOR_LINE}\n")
+    assert not env.paths.state_dir.exists()
+
+
+def test_status_gateway_wait_is_rounded_to_a_tenth_and_ints_pass(env: Env) -> None:
+    env.gateway.answer = hosts_answer(
+        a=host_entry(oldest_wait_s=12.44),
+        b=host_entry(oldest_wait_s=3),
+        c=host_entry(oldest_wait_s=0.0),
+    )
+    waits = [line.rsplit(" ", 1)[1] for line in env.run("status")[1].splitlines()[1:]]
+    assert waits == ["oldest_wait_s=12.4", "oldest_wait_s=3", "oldest_wait_s=0.0"]
+    env.gateway.answer = hosts_answer(a=host_entry(oldest_wait_s=10**400))
+    code, out = env.run("status")
+    assert code == 0 and out.endswith(f"oldest_wait_s={10**400}\n")
+
+
+def test_status_defaults_to_the_real_http_json_reading_the_gateway_url(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = Gateway(two_hosts())
+    monkeypatch.setattr(hosts, "http_json", fake)
+    out = io.StringIO()
+    code = main(["status"], home=env.home, policy_path=env.policy, clock=env.clock, out=out)
+    assert code == 0 and out.getvalue().splitlines()[-2:] == [WORKSTATION_LINE, EXECUTOR_LINE]
+    assert fake.calls == [(GATEWAY_URL, None, 2.0)]
+
+
+HTTP_403 = urllib.error.HTTPError(GATEWAY_URL, 403, "Forbidden", Message(), None)
+HTTP_404 = urllib.error.HTTPError(GATEWAY_URL, 404, "Not Found", Message(), None)
+UNREACHABLE = urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+
+
+@pytest.mark.parametrize(
+    ("failure", "reason"),
+    [
+        (ConnectionRefusedError(111, "Connection refused"), "[Errno 111] Connection refused"),
+        (UNREACHABLE, "<urlopen error [Errno 111] Connection refused>"),
+        (TimeoutError("timed out"), "timed out"),
+        (HTTP_403, "HTTP Error 403: Forbidden"),
+        (HTTP_404, "HTTP Error 404: Not Found"),
+        (
+            json.JSONDecodeError("Expecting value", "", 0),
+            "Expecting value: line 1 column 1 (char 0)",
+        ),
+        (
+            ValueError(f"{GATEWAY_URL}: answer over 8388608 bytes"),
+            f"{GATEWAY_URL}: answer over 8388608 bytes",
+        ),
+        (OSError("two\n  lines"), "two lines"),
+        (OSError(), "OSError"),
+        (OSError("x" * 79), "x" * 79),
+        (OSError("x" * 80), "x" * 80),
+        (OSError("x" * 81), "x" * 77 + "..."),
+        (OSError("x" * 200), "x" * 77 + "..."),
+        (OSError("\x1b[31mred"), "[31mred"),
+        (OSError("a\u202eb\x00c\x7fd\u00a0e\re"), "a b c d e e"),
+        (OSError("\x1b\x07"), "OSError"),
+    ],
+)
+def test_status_reports_a_gateway_that_does_not_answer_and_still_exits_0(
+    env: Env, failure: Exception, reason: str
+) -> None:
+    open_state(env.paths).close()
+    env.gateway.answer = failure
+    code, out = env.run("status")
+    assert code == 0 and out.splitlines()[-1] == f"gateway: not answering ({reason})"
+    assert "gateway workstation" not in out and "Traceback" not in out
+    assert all(c.isprintable() or c == "\n" for c in out)
+    assert env.gateway.calls == [(GATEWAY_URL, None, 2.0)]
+
+
+def one_host(entry: object) -> dict[str, object]:
+    return {"hosts": {"workstation": entry}}
+
+
+HOSTS_BAD = "hosts is missing, empty or not an object"
+QUEUED_BAD = "workstation: queued is missing or not an object"
+BAD_SHAPES: dict[str, tuple[object, str]] = {
+    "answer-a-list": ([], HOSTS_BAD),
+    "answer-a-string": ("ok", HOSTS_BAD),
+    "answer-null": (None, HOSTS_BAD),
+    "no-hosts-key": ({}, HOSTS_BAD),
+    "hosts-a-list": ({"hosts": []}, HOSTS_BAD),
+    "hosts-empty": ({"hosts": {}}, HOSTS_BAD),
+    "host-not-an-object": (one_host(3), "workstation: not an object"),
+    "queued-missing": (one_host(without(host_entry(), "queued")), QUEUED_BAD),
+    "queued-a-list": (one_host(host_entry(queued=[])), QUEUED_BAD),
+    "queued-a-full-list": (one_host(host_entry(queued=[0] * 6)), QUEUED_BAD),
+    "slots-missing": (
+        one_host(without(host_entry(), "slots")),
+        "workstation: slots is missing or not a non-negative integer",
+    ),
+    "slots-bool": (
+        one_host(host_entry(slots=True)),
+        "workstation: slots is missing or not a non-negative integer",
+    ),
+    "slots-float": (
+        one_host(host_entry(slots=1.0)),
+        "workstation: slots is missing or not a non-negative integer",
+    ),
+    "slots-string": (
+        one_host(host_entry(slots="1")),
+        "workstation: slots is missing or not a non-negative integer",
+    ),
+    "slots-negative": (
+        one_host(host_entry(slots=-1)),
+        "workstation: slots is missing or not a non-negative integer",
+    ),
+    "in-flight-missing": (
+        one_host(without(host_entry(), "in_flight")),
+        "workstation: in_flight is missing or not a non-negative integer",
+    ),
+    "in-flight-bool": (
+        one_host(host_entry(in_flight=False)),
+        "workstation: in_flight is missing or not a non-negative integer",
+    ),
+    "wait-missing": (
+        one_host(without(host_entry(), "oldest_wait_s")),
+        "workstation: oldest_wait_s is missing or not a non-negative number or null",
+    ),
+    "wait-string": (
+        one_host(host_entry(oldest_wait_s="12.4")),
+        "workstation: oldest_wait_s is missing or not a non-negative number or null",
+    ),
+    "wait-bool": (
+        one_host(host_entry(oldest_wait_s=True)),
+        "workstation: oldest_wait_s is missing or not a non-negative number or null",
+    ),
+    "wait-nan": (
+        one_host(host_entry(oldest_wait_s=float("nan"))),
+        "workstation: oldest_wait_s is missing or not a non-negative number or null",
+    ),
+    "wait-inf": (
+        one_host(host_entry(oldest_wait_s=float("inf"))),
+        "workstation: oldest_wait_s is missing or not a non-negative number or null",
+    ),
+    "wait-negative": (
+        one_host(host_entry(oldest_wait_s=-0.5)),
+        "workstation: oldest_wait_s is missing or not a non-negative number or null",
+    ),
+}
+
+
+@pytest.mark.parametrize(("answer", "what"), BAD_SHAPES.values(), ids=BAD_SHAPES)
+def test_status_reports_a_bad_gateway_shape_as_unexpected_and_still_exits_0(
+    env: Env, answer: object, what: str
+) -> None:
+    env.gateway.answer = answer
+    assert env.run("status") == (
+        0,
+        f"no state yet\ngateway: unexpected /pastore/status answer ({what})\n",
+    )
+
+
+@pytest.mark.parametrize("level", LEVELS)
+def test_status_needs_every_level_name_as_a_plain_count(env: Env, level: str) -> None:
+    full = dict.fromkeys(LEVELS, 0)
+    bad = f"gateway: unexpected /pastore/status answer (workstation: queued.{level} is missing or not a non-negative integer)\n"
+    for broken in (
+        {k: v for k, v in full.items() if k != level},
+        {**full, level: True},
+        {**full, level: 1.5},
+        {**full, level: None},
+        {**full, level: -1},
+    ):
+        env.gateway.answer = one_host(host_entry(queued=broken))
+        assert env.run("status") == (0, f"no state yet\n{bad}")
+
+
+def unexpected(what: str) -> str:
+    return f"gateway: unexpected /pastore/status answer ({what})\n"
+
+
+NAME_RULE = "is not 1 to 64 of A-Z a-z 0-9 . _ -"
+
+
+def test_status_refuses_a_host_name_that_would_forge_a_second_line(env: Env) -> None:
+    env.gateway.answer = hosts_answer(**{"ws\ngateway fake: slots=99": host_entry()})
+    assert env.run("status") == (
+        0,
+        "no state yet\n" + unexpected(rf"host name 'ws\ngateway fake: slots=99' {NAME_RULE}"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "shown"),
+    [
+        ("", "''"),
+        ("has space", "'has space'"),
+        ("a\x1b[31m", r"'a\x1b[31m'"),
+        ("caf\u00e9", "'caf\u00e9'"),
+        ("a/b", "'a/b'"),
+        ("a\nb", r"'a\nb'"),
+        ("ws\n", r"'ws\n'"),
+    ],
+)
+def test_status_refuses_host_names_outside_the_plain_name_alphabet(
+    env: Env, name: str, shown: str
+) -> None:
+    env.gateway.answer = hosts_answer(**{name: host_entry()})
+    assert env.run("status") == (0, f"no state yet\n{unexpected(f'host name {shown} {NAME_RULE}')}")
+
+
+@pytest.mark.parametrize("name", ["a" * 65, "a" * 299 + "\n", "\u00e9" * 300])
+def test_status_caps_the_unexpected_text_for_a_long_host_name(env: Env, name: str) -> None:
+    env.gateway.answer = hosts_answer(**{name: host_entry()})
+    code, out = env.run("status")
+    line = out.splitlines()[-1]
+    prefix = "gateway: unexpected /pastore/status answer ("
+    assert code == 0 and out.count("\n") == 2
+    assert line.startswith(prefix + "host name '") and line.endswith("...)")
+    assert len(line) == len(prefix) + 80 + 1
+
+
+def test_status_prints_a_host_name_of_up_to_64_plain_characters(env: Env) -> None:
+    name = "Ab9._-" + "a" * 58
+    env.gateway.answer = hosts_answer(**{name: host_entry()})
+    code, out = env.run("status")
+    assert code == 0 and out.splitlines()[-1].startswith(f"gateway {name}: slots=1 in_flight=0 ")
+
+
+def test_status_with_an_invalid_policy_exits_1_and_prints_no_gateway_line(env: Env) -> None:
+    open_state(env.paths).close()
+    env.policy.write_text("version: 7\n")
+    env.gateway.answer = two_hosts()
+    code, out = env.run("status")
+    lines = out.splitlines()
+    assert code == 1 and lines[:2] == ["dispatcher: dispatcher-down", "idle: none"]
+    assert lines[2].startswith("policy error: ") and "version must be 2" in lines[2]
+    assert len(lines) == 3 and "gateway" not in out
+    assert env.gateway.calls == []
+
+
+def test_status_prints_no_gateway_host_line_when_a_later_host_is_malformed(env: Env) -> None:
+    env.gateway.answer = hosts_answer(workstation=host_entry(), executor=host_entry(slots=True))
+    code, out = env.run("status")
+    assert code == 0 and "gateway workstation" not in out
+    assert out.splitlines()[-1] == (
+        "gateway: unexpected /pastore/status answer (executor: slots is missing or not a non-negative integer)"
+    )
 
 
 def test_stop_writes_the_request(env: Env) -> None:
@@ -503,3 +868,19 @@ def test_start_passes_the_state_paths_and_the_real_environment_to_serve(
     assert env.run("start")[0] == 0
     assert seen["deps"].paths == env.paths
     assert seen["deps"].base_env == dict(os.environ)
+
+
+def test_start_gives_the_dispatcher_the_gateway_url_and_the_real_http_json(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, Deps] = {}
+
+    def fake_serve(deps: Deps, policy_path: Path, **_kw: object) -> int:
+        seen["deps"] = deps
+        return 0
+
+    monkeypatch.setattr(cli, "serve", fake_serve)
+    assert env.run("start")[0] == 0
+    assert seen["deps"].ollama_url == "http://127.0.0.1:11434"
+    assert seen["deps"].http_json is hosts.http_json
+    assert env.gateway.calls == []

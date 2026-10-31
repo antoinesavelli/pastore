@@ -34,6 +34,8 @@ HEADER = (
     "# Adding a pair is ask-first: `pastore add <consumer>/<id> --model <name> --evidence <path>`"
     " with a passing\n"
     "# `pastore check --contract <consumer>/<id>` (docs/DESIGN-v5.md R29).\n"
+    "# Each host's context is its Ollama's default context length in tokens;"
+    " placement counts KV cache per slot at it (D-041).\n"
 )
 
 
@@ -116,6 +118,7 @@ def _parse_host(name: object, body: object, problems: list[str]) -> Host | None:
         "vram_gb": _positive,
         "max_models": _positive,
         "parallel": _positive,
+        "context": _positive,
     }
     fields = _fields(f"host {name!r}", body, shape, problems)
     return None if fields is None else Host(name, **fields)
@@ -409,7 +412,10 @@ def _strings(values: tuple[str, ...]) -> str:
 
 
 def _host_line(host: Host) -> str:
-    fields = f"url: {_quote(host.url)}, vram_gb: {host.vram_gb}, max_models: {host.max_models}, parallel: {host.parallel}"
+    fields = (
+        f"url: {_quote(host.url)}, vram_gb: {host.vram_gb}, max_models: {host.max_models},"
+        f" parallel: {host.parallel}, context: {host.context}"
+    )
     return f"  {_key(host.name)}: {{{fields}}}"
 
 

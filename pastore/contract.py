@@ -74,7 +74,7 @@ def _scenario(
     with ExitStack() as stack:
         server = None if name == "refused" else stack.enter_context(fake(_FAKE_MODES[name]))
         url = refused() if server is None else server.url
-        handle = start(spec, run_dir, run_id, url, base_env)
+        handle = start(spec, run_dir, run_id, url, spec.models[0], base_env)
         began = clock()
         exit_code = handle.poll()
         timed_out = False

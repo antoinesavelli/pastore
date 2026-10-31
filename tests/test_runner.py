@@ -4,6 +4,7 @@ Depends on: pastore.runner, pastore.spec, tests.fakes (RecordingRunner).
 """
 
 import subprocess
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -57,7 +58,7 @@ def test_invariant_job_env_has_run_dir_and_no_leaked_vars(tmp_path: Path) -> Non
         "ANTHROPIC_API_KEY": "secret",
         "PYTHONPATH": "/elsewhere",
     }
-    env = job_env(make_spec(tmp_path, {"MODE": "x"}), run_dir, "http://127.0.0.1:1", base)
+    env = job_env(make_spec(tmp_path, {"MODE": "x"}), run_dir, "http://127.0.0.1:1", "m1", base)
     assert env == {
         "PATH": "/usr/bin",
         "HOME": "/home/u",
@@ -67,7 +68,19 @@ def test_invariant_job_env_has_run_dir_and_no_leaked_vars(tmp_path: Path) -> Non
         "PASTORE_RUN_DIR": str(run_dir.out),
         "FUCONE_RUN_DIR": str(run_dir.out),
         "OLLAMA_HOST": "http://127.0.0.1:1",
+        "PASTORE_MODEL": "m1",
     }
+
+
+def test_job_env_passes_the_model_in_model_env_and_the_manifest_cannot_override_it(
+    tmp_path: Path,
+) -> None:
+    run_dir = make_run_dir(tmp_path / "runs", "r1")
+    spec = replace(make_spec(tmp_path, {"PASTORE_MODEL": "evil", "OTHER": "o"}), model_env="WHICH")
+    env = job_env(spec, run_dir, "http://u", "qwen3:8b", {})
+    assert env["WHICH"] == "qwen3:8b" and env["OTHER"] == "o"
+    named = job_env(make_spec(tmp_path, {"PASTORE_MODEL": "evil"}), run_dir, "http://u", "m1", {})
+    assert named["PASTORE_MODEL"] == "m1"
 
 
 def test_run_dir_is_outside_repo_and_never_reused(tmp_path: Path) -> None:
@@ -144,13 +157,14 @@ def test_start_run_passes_wrapped_argv_explicit_env_and_new_session(tmp_path: Pa
         return FakeProc()
 
     handle = start_run(
-        spec, run_dir, "r1", "http://u", {"PATH": "/bin", "SECRET": "s"}, popen=popen
+        spec, run_dir, "r1", "http://u", "m1", {"PATH": "/bin", "SECRET": "s"}, popen=popen
     )
     assert handle.run_id == "r1"
     assert seen["argv"] == scope_argv("r1", spec.argv, spec.timeout_s)
     assert seen["cwd"] == tmp_path and seen["start_new_session"] is True
     assert seen["stdin"] == subprocess.DEVNULL
     assert "SECRET" not in seen["env"] and seen["env"]["OLLAMA_HOST"] == "http://u"
+    assert seen["env"]["PASTORE_MODEL"] == "m1"
     assert run_dir.stdout.exists() and run_dir.stderr.exists()
     assert seen["stdout"].closed and seen["stderr"].closed
 

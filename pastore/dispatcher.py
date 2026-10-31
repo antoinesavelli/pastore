@@ -1,6 +1,6 @@
-"""The dispatcher: each tick heartbeats, honours stop and run-now requests, watches the running job, or starts the next.
+"""The fleet dispatcher: each tick heartbeats, honours stop and run-now requests, watches every running job, and places the ready ones.
 
-Depends on: policy (PolicyCache), manifest, state (State, rows, lock), checks (Host), runner, contract (Started), spec.
+Depends on: policy (PolicyCache), manifest, state (State, rows, lock), checks (Host), hosts (read_host), placement (place), runner, contract (Started), spec.
 """
 
 import math
@@ -16,10 +16,12 @@ from types import FrameType
 
 from pastore.checks import Host, host_idle_reason, stopped
 from pastore.contract import Started
+from pastore.hosts import HostState, HttpJson, executor_reason, read_host
 from pastore.manifest import ManifestError
+from pastore.placement import HostLoad, ModelFacts, kv_bytes_per_slot, place
 from pastore.policy import Policy, PolicyCache
-from pastore.runner import BASE_ENV_KEYS, RunDir, fresh_run_dir, stop_leftovers
-from pastore.spec import WORKSTATION, RunReader, TaskSpec, idle_reason
+from pastore.runner import RunDir, fresh_run_dir, stop_leftovers
+from pastore.spec import BASE_ENV_KEYS, WORKSTATION, RunReader, TaskSpec, idle_reason
 from pastore.state import DispatcherLock, JobRow, RunRow, State, StatePaths, open_state
 
 MAX_ATTEMPTS = 3
@@ -28,7 +30,7 @@ TICK_S = 30.0
 
 RunIn = Callable[[Sequence[str], Path, Mapping[str, str]], CompletedProcess[str]]
 LoadManifest = Callable[[Path, str], dict[str, TaskSpec]]
-StartRun = Callable[[TaskSpec, RunDir, str, str, Mapping[str, str]], Started]
+StartRun = Callable[[TaskSpec, RunDir, str, str, str, Mapping[str, str]], Started]
 Unit = tuple[TaskSpec, str]
 
 
@@ -43,14 +45,16 @@ class Deps:
     start: StartRun
     base_env: Mapping[str, str]
     ollama_url: str
+    http_json: HttpJson
 
 
 @dataclass(frozen=True)
 class Active:
-    """The one running job."""
+    """One running job and the host it was placed on."""
 
     spec: TaskSpec
     model: str
+    host: str
     run_id: str
     run_dir: RunDir
     started_at: datetime
@@ -69,7 +73,8 @@ class Dispatcher:
         self.deps = deps
         self.state = state
         self.policy = policy
-        self.active: Active | None = None
+        self.active: dict[str, Active] = {}
+        self.loaded_seen: dict[tuple[str, str], int] = {}
         self.draining = False
         self.terminated = False
         self._refused: set[tuple[str, str]] = set()
@@ -97,11 +102,9 @@ class Dispatcher:
         policy = self.policy.current()
         if not self._handle_stop_request(now):
             return False
-        if self.active is not None:
-            self._watch(now)
-            return not (self.active is None and self.draining)
+        self._watch_all(now, policy)
         if self.draining:
-            return False
+            return bool(self.active)
         self._dispatch(now, policy)
         return True
 
@@ -109,32 +112,55 @@ class Dispatcher:
         mode = "sigterm" if self.terminated else self.state.stop_requested()
         if mode is None:
             return True
-        # Logged first: on shutdown, systemd may SIGKILL us while the job is being stopped.
+        # Logged first: on shutdown, systemd may SIGKILL us while the jobs are being stopped.
         self.state.record_event(now, "dispatcher-stop", detail=mode)
-        if mode != "graceful" and self.active is not None:
-            self._stop_active(now)
+        if mode != "graceful":
+            self._stop_all(now)
         self.draining = True
         self.state.clear_stop()
-        return self.active is not None
+        return bool(self.active)
 
-    def _stop_active(self, now: datetime) -> None:
-        assert self.active is not None
-        active, self.active = self.active, None
-        code = active.handle.stop(self.deps.host.run)
-        self._end_run(active, now, "stopped", code)
-        self.state.upsert_job(replace(self._job(active.spec, active.model), status="pending"))
+    def _stop_all(self, now: datetime) -> None:
+        for run_id, active in list(self.active.items()):
+            code = active.handle.stop(self.deps.host.run)
+            self._end_run(active, now, "stopped", code)
+            self.state.upsert_job(replace(self._job(active.spec, active.model), status="pending"))
+            del self.active[run_id]
 
-    def _watch(self, now: datetime) -> None:
-        assert self.active is not None
-        code = self.active.handle.poll()
-        limit = timedelta(seconds=self.active.spec.timeout_s)
-        timed_out = code is None and now - self.active.started_at > limit
+    def _watch_all(self, now: datetime, policy: Policy) -> None:
+        for run_id, active in list(self.active.items()):
+            outcome = self._poll(now, active)
+            if outcome is None:
+                continue
+            code, timed_out = outcome
+            if self._executor_lost(active, policy, code, timed_out):
+                self._release(active, now, code)
+            else:
+                self._finish(active, now, code, timed_out)
+            del self.active[run_id]
+
+    def _poll(self, now: datetime, active: Active) -> tuple[int, bool] | None:
+        """The exit code and whether the run timed out, or None while it goes on."""
+        code = active.handle.poll()
+        limit = timedelta(seconds=active.spec.timeout_s)
+        timed_out = code is None and now - active.started_at > limit
         if timed_out:
-            code = self.active.handle.stop(self.deps.host.run)
-        if code is None:
-            return
-        active, self.active = self.active, None
-        self._finish(active, now, code, timed_out)
+            code = active.handle.stop(self.deps.host.run)
+        return None if code is None else (code, timed_out)
+
+    def _executor_lost(self, active: Active, policy: Policy, code: int, timed_out: bool) -> bool:
+        """Check 9: a non-ok end on a non-workstation host that no longer answers is the host's fault."""
+        host = policy.hosts.get(active.host)
+        if host is None or host.name == WORKSTATION:
+            return False
+        if not timed_out and code in active.spec.ok_exit:
+            return False
+        return executor_reason(host, self.deps.http_json) is not None
+
+    def _release(self, active: Active, now: datetime, code: int) -> None:
+        """End a run the lost host cut short: stopped, back to pending, no attempt charged."""
+        self._end_run(active, now, "stopped", code, idle_reason("executor-down"))
+        self.state.upsert_job(replace(self._job(active.spec, active.model), status="pending"))
 
     def _finish(self, active: Active, now: datetime, code: int, timed_out: bool) -> None:
         spec = active.spec
@@ -175,29 +201,42 @@ class Dispatcher:
         )
         self.state.record_event(now, "done", spec.ref, active.run_id)
 
-    def _end_run(self, active: Active, now: datetime, status: str, code: int | None) -> None:
+    def _end_run(
+        self, active: Active, now: datetime, status: str, code: int | None, detail: str = ""
+    ) -> None:
         run = self.state.get_run(active.run_id)
         assert run is not None
-        self.state.update_run(replace(run, status=status, ended_at=iso(now), exit_code=code))
-        self.state.record_event(now, "run-end", active.spec.ref, f"{active.run_id} {status} {code}")
+        ended = replace(run, status=status, ended_at=iso(now), exit_code=code, detail=detail)
+        self.state.update_run(ended)
+        text = f"{active.run_id} {status} {code}" + (f" {detail}" if detail else "")
+        self.state.record_event(now, "run-end", active.spec.ref, text)
 
     def _env(self, spec: TaskSpec) -> dict[str, str]:
         base = {k: self.deps.base_env[k] for k in BASE_ENV_KEYS if k in self.deps.base_env}
         return {**base, **spec.env}
 
     def _dispatch(self, now: datetime, policy: Policy) -> None:
-        units = self._listed(now, policy)
+        units = self._not_running(self._listed(now, policy))
         forced = self._run_now(now, units)
-        ready = [forced] if forced else [u for u in units if self._is_ready(now, *u)]
-        reason = self._idle_reason(ready)
-        if reason is not None:
-            if forced is not None:
-                detail = f"{forced[1]}: run-now: {reason}"
-                self.state.record_event(now, "refused", forced[0].ref, detail)
+        ready = [] if forced is None else [forced]
+        ready += [u for u in units if u is not forced and self._is_ready(now, *u)]
+        reason = self._gate(ready, policy)
+        placed = 0
+        if reason is None:
+            states = self._read_hosts(policy, ready)
+            reason = _unplaced_reason(states)
+            placed = self._place_all(now, self._loads(states), ready, forced, reason)
+        elif forced is not None:
+            self._refuse_run_now(now, forced, reason)
+        if placed or self.active:
+            self.state.clear_idle_reason()
+        else:
             self.state.set_idle_reason(now, reason)
-            return
-        self.state.clear_idle_reason()
-        self._start(now, *ready[0])
+
+    def _not_running(self, units: list[Unit]) -> list[Unit]:
+        """Drop the pairs with a run in flight, so they are never ready-checked, run-now'd or started twice."""
+        running = {(a.spec.ref, a.model) for a in self.active.values()}
+        return [u for u in units if (u[0].ref, u[1]) not in running]
 
     def _run_now(self, now: datetime, units: list[Unit]) -> Unit | None:
         key = self.state.run_now_requested()
@@ -212,12 +251,66 @@ class Dispatcher:
             self.state.record_event(now, "refused", key[0], detail)
         return match[0] if match else None
 
-    def _idle_reason(self, ready: list[Unit]) -> str | None:
+    def _refuse_run_now(self, now: datetime, unit: Unit, reason: str) -> None:
+        self.state.record_event(now, "refused", unit[0].ref, f"{unit[1]}: run-now: {reason}")
+
+    def _gate(self, ready: list[Unit], policy: Policy) -> str | None:
+        """The idle reason that keeps every ready unit waiting, or None when placement may go on."""
         if stopped(self.deps.paths.stop_file):
             return idle_reason("stopped")
         if not ready:
             return idle_reason("no-ready-task")
-        return host_idle_reason(self.deps.host, self.deps.ollama_url)
+        return host_idle_reason(self.deps.host, policy.hosts[WORKSTATION].url)
+
+    def _read_hosts(self, policy: Policy, ready: list[Unit]) -> list[HostState]:
+        """Every policy host's facts for the ready units' models and the held ones; refreshes `loaded_seen`."""
+        wanted = [model for _, model in ready] + [a.model for a in self.active.values()]
+        states = [read_host(host, self.deps.http_json, wanted) for host in policy.hosts.values()]
+        for state in states:
+            for model, size in state.loaded.items():
+                self.loaded_seen[(state.host.name, model)] = size
+        return states
+
+    def _loads(self, states: list[HostState]) -> list[HostLoad]:
+        """The healthy hosts as placement sees them, one `held` entry per run active there."""
+        return [
+            HostLoad(
+                state.host,
+                {
+                    model: ModelFacts(
+                        size,
+                        _kv_per_slot(state, model),
+                        self.loaded_seen.get((state.host.name, model)),
+                    )
+                    for model, size in state.sizes.items()
+                },
+                state.resident,
+                tuple(a.model for a in self.active.values() if a.host == state.host.name),
+            )
+            for state in states
+            if state.reason is None
+        ]
+
+    def _place_all(
+        self,
+        now: datetime,
+        loads: list[HostLoad],
+        ready: list[Unit],
+        forced: Unit | None,
+        reason: str,
+    ) -> int:
+        """Start each ready unit where it fits, in order; the number of starts attempted."""
+        attempted = 0
+        for unit in ready:
+            host = place(unit[1], loads)
+            if host is None:
+                if unit is forced:
+                    self._refuse_run_now(now, unit, reason)
+                continue
+            attempted += 1
+            if self._start(now, *unit, host):
+                _hold(loads, host, unit[1])
+        return attempted
 
     def _listed(self, now: datetime, policy: Policy) -> list[Unit]:
         units = []
@@ -296,21 +389,23 @@ class Dispatcher:
             detail = f"{job.model}: ready since {job.ready_since}"
             self.state.record_event(now, "starved", job.ref, detail)
 
-    def _start(self, now: datetime, spec: TaskSpec, model: str) -> None:
+    def _start(self, now: datetime, spec: TaskSpec, model: str, host: str) -> bool:
         run_id, run_dir = fresh_run_dir(self.deps.paths.runs_dir, now)
-        run = RunRow(run_id, spec.ref, model, WORKSTATION, spec.fingerprint, "running", iso(now))
+        run = RunRow(run_id, spec.ref, model, host, spec.fingerprint, "running", iso(now))
         self.state.insert_run(run)
         self.state.upsert_job(replace(self._job(spec, model), status="running"))
-        self.state.record_event(now, "run-start", spec.ref, f"{run_id} {model}")
+        self.state.record_event(now, "run-start", spec.ref, f"{run_id} {model} {host}")
         try:
             handle = self.deps.start(
-                spec, run_dir, run_id, self.deps.ollama_url, self.deps.base_env
+                spec, run_dir, run_id, self.deps.ollama_url, model, self.deps.base_env
             )
         except OSError as exc:
-            self._finish(Active(spec, model, run_id, run_dir, now, _NoHandle()), now, 127, False)
+            failed = Active(spec, model, host, run_id, run_dir, now, _NoHandle())
+            self._finish(failed, now, 127, False)
             self.state.record_event(now, "refused", spec.ref, f"{model}: could not start: {exc}")
-            return
-        self.active = Active(spec, model, run_id, run_dir, now, handle)
+            return False
+        self.active[run_id] = Active(spec, model, host, run_id, run_dir, now, handle)
+        return True
 
 
 class _NoHandle:
@@ -321,6 +416,24 @@ class _NoHandle:
 
     def stop(self, run: object, wait_s: float = 30.0) -> int:
         return 127
+
+
+def _kv_per_slot(state: HostState, model: str) -> int | None:
+    shape = state.kv.get(model)
+    if shape is None:
+        return None
+    return kv_bytes_per_slot(shape.layers, shape.kv_heads, shape.head_dim, state.host.context)
+
+
+def _unplaced_reason(states: list[HostState]) -> str:
+    """Why a unit that fits nowhere waits: the first unreadable host's reason, else no-fit."""
+    return next((s.reason for s in states if s.reason is not None), idle_reason("no-fit"))
+
+
+def _hold(loads: list[HostLoad], host: str, model: str) -> None:
+    """Count a run just started on `host` as held there, for the units placed after it this tick."""
+    index = next(i for i, load in enumerate(loads) if load.host.name == host)
+    loads[index] = replace(loads[index], held=(*loads[index].held, model))
 
 
 def _charge_crash(job: JobRow) -> JobRow:
@@ -370,6 +483,10 @@ def serve(
 
 def _nap(dispatcher: Dispatcher, sleep: Callable[[float], None], tick_s: float) -> None:
     """Sleep one tick in 1 s steps, so a SIGTERM is acted on before a shutdown's SIGKILL."""
+    if dispatcher.terminated:
+        # A tick after SIGTERM failed (a clean one would have ended the loop): retry once a second, never spin.
+        sleep(1.0)
+        return
     for _ in range(math.ceil(tick_s)):
         if dispatcher.terminated:
             return

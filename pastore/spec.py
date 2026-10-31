@@ -20,6 +20,8 @@ IDLE_REASONS = (
 )
 TASK_EVENTS = ("refused", "reader-failed", "awaiting-review", "starved", "done", "failed")
 WORKSTATION = "workstation"
+BASE_ENV_KEYS = ("PATH", "HOME", "LANG", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
+RUN_DIR_ENV = ("PASTORE_RUN_DIR", "FUCONE_RUN_DIR")
 SOURCE_KINDS = ("cgroup", "peer", "ancestor", "under")
 EXCLUDABLE_KINDS = ("cgroup", "peer")
 
@@ -40,13 +42,17 @@ UNKNOWN_LEVEL = Level.ROUTINE
 
 @dataclass(frozen=True)
 class Host:
-    """One machine from `policy.yaml` `hosts:` (R23, R25): its Ollama URL, VRAM, model cap and per-model parallelism."""
+    """One machine from `policy.yaml` `hosts:` (R23, R25): Ollama URL, VRAM, model cap, per-model parallelism, context.
+
+    `context` is the host Ollama's default context length in tokens (D-041: KV cache per slot is counted at it).
+    """
 
     name: str
     url: str
     vram_gb: int
     max_models: int
     parallel: int
+    context: int
 
 
 @dataclass(frozen=True)

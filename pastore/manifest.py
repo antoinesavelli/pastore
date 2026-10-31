@@ -13,7 +13,7 @@ from pathlib import Path
 
 import yaml
 
-from pastore.spec import Ready, RunReader, TaskSpec, ValidateReader
+from pastore.spec import BASE_ENV_KEYS, RUN_DIR_ENV, Ready, RunReader, TaskSpec, ValidateReader
 
 ALLOWED_BARE = frozenset({"torra", "opencode"})
 NAME = re.compile(r"[a-z0-9][a-z0-9_-]*")
@@ -23,7 +23,8 @@ UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600}
 TASK_KEYS = frozenset(
     "id kind argv cwd env model models timeout ok_exit resumable ollama_env model_env reader ready".split()
 )
-RESERVED_ENV = frozenset({"PASTORE_RUN_DIR", "FUCONE_RUN_DIR"})
+RESERVED_ENV = frozenset(RUN_DIR_ENV)
+PASTORE_SETS = frozenset(BASE_ENV_KEYS) | RESERVED_ENV
 Which = Callable[[str], str | None]
 _NO_ARGV: tuple[str, ...] = ()
 _NO_READER: RunReader | ValidateReader = RunReader(())
@@ -75,12 +76,20 @@ def _cwd(value: object, root: Path) -> Path:
     return Path(real)
 
 
+def _ollama_env(value: object) -> str:
+    if not isinstance(value, str) or not ENV_NAME.fullmatch(value):
+        raise ManifestError(f"ollama_env must match {ENV_NAME.pattern}")
+    if value in PASTORE_SETS:
+        raise ManifestError(f"ollama_env {value!r} may not be any of {sorted(PASTORE_SETS)}")
+    return value
+
+
 def _model_env(value: object, ollama_env: str) -> str:
     if not isinstance(value, str) or not ENV_NAME.fullmatch(value):
         raise ManifestError(f"model_env must match {ENV_NAME.pattern}")
-    if value == ollama_env or value in RESERVED_ENV:
+    if value == ollama_env or value in PASTORE_SETS:
         raise ManifestError(
-            f"model_env {value!r} may not be ollama_env or any of {sorted(RESERVED_ENV)}"
+            f"model_env {value!r} may not be ollama_env or any of {sorted(PASTORE_SETS)}"
         )
     return value
 
@@ -184,10 +193,7 @@ def _parse_task(
         errors.append(f"{tid}: kind must be a non-empty string")
     if raw.get("resumable") is not True:
         errors.append(f"{tid}: resumable must be literally true")
-    ollama_env = raw.get("ollama_env")
-    if not isinstance(ollama_env, str) or not ENV_NAME.fullmatch(ollama_env):
-        errors.append(f"{tid}: ollama_env must match {ENV_NAME.pattern}")
-        ollama_env = ""
+    ollama_env = guard(lambda: _ollama_env(raw.get("ollama_env")), "")
     model_env = guard(lambda: _model_env(raw.get("model_env"), ollama_env), "")
     cwd = guard(lambda: _cwd(raw.get("cwd"), root), root)
     argv = guard(lambda: _argv(raw.get("argv"), "argv"), _NO_ARGV)

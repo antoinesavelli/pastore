@@ -11,9 +11,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
-from pastore.spec import TaskSpec
+from pastore.spec import BASE_ENV_KEYS, RUN_DIR_ENV, TaskSpec
 
-BASE_ENV_KEYS = ("PATH", "HOME", "LANG", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
 _SCOPE_NAME = re.compile(r"^pastore-.+\.scope$")
 Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 
@@ -62,14 +61,16 @@ def make_run_dir(runs_dir: Path, run_id: str) -> RunDir:
 
 
 def job_env(
-    spec: TaskSpec, run_dir: RunDir, ollama_url: str, base: Mapping[str, str]
+    spec: TaskSpec, run_dir: RunDir, ollama_url: str, model: str, base: Mapping[str, str]
 ) -> dict[str, str]:
-    """The explicit job environment: base keys, manifest env, the run dir, the Ollama URL."""
+    """The explicit job environment: base keys, manifest env, the run dir, the Ollama URL, the model."""
     env = {key: base[key] for key in BASE_ENV_KEYS if key in base}
     env.update(spec.env)
     # FUCONE_RUN_DIR: compatibility until consumers read PASTORE_RUN_DIR (R31)
-    env["PASTORE_RUN_DIR"] = env["FUCONE_RUN_DIR"] = str(run_dir.out)
+    for name in RUN_DIR_ENV:
+        env[name] = str(run_dir.out)
     env[spec.ollama_env] = ollama_url
+    env[spec.model_env] = model
     return env
 
 
@@ -117,6 +118,7 @@ def start_run(
     run_dir: RunDir,
     run_id: str,
     ollama_url: str,
+    model: str,
     base_env: Mapping[str, str],
     *,
     popen: Callable[..., PopenLike] = subprocess.Popen,
@@ -127,7 +129,7 @@ def start_run(
         proc = popen(
             wrap(run_id, spec.argv, spec.timeout_s),
             cwd=spec.cwd,
-            env=job_env(spec, run_dir, ollama_url, base_env),
+            env=job_env(spec, run_dir, ollama_url, model, base_env),
             stdout=out_log,
             stderr=err_log,
             stdin=subprocess.DEVNULL,

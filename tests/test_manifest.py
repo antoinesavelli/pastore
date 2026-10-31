@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from pastore.manifest import ManifestError, load_manifest, parse_duration
-from pastore.spec import Ready, RunReader, ValidateReader
+from pastore.spec import BASE_ENV_KEYS, RUN_DIR_ENV, Ready, RunReader, ValidateReader
 
 TASK = """  - id: bench
     kind: eval
@@ -23,6 +23,8 @@ TASK = """  - id: bench
     reader: {run: [.venv/bin/python, read.py]}
 """
 OTHER = TASK.replace("id: bench", "id: second")
+PASTORE_SETS = (*BASE_ENV_KEYS, *RUN_DIR_ENV)
+CURRENT = {"ollama_env": "OLLAMA_HOST", "model_env": "PASTORE_MODEL"}
 
 
 def fake_which(name: str) -> str | None:
@@ -140,8 +142,6 @@ def test_fingerprint_is_per_task_entry(tmp_path: Path) -> None:
             "ollama_env: MY_OLLAMA\n    model_env: MY_OLLAMA",
             "model_env 'MY_OLLAMA' may not",
         ),
-        ("model_env: PASTORE_MODEL", "model_env: PASTORE_RUN_DIR", "model_env 'PASTORE_RUN_DIR'"),
-        ("model_env: PASTORE_MODEL", "model_env: FUCONE_RUN_DIR", "model_env 'FUCONE_RUN_DIR'"),
         ("env: {MODE: fast}", "env: {PASTORE_MODEL: x}", r"env may not set \['PASTORE_MODEL'\]"),
         ("    model: qwen3:8b\n", "", "exactly one of model or models"),
         ("model: qwen3:8b", "model: a\n    models: [b]", "exactly one of model or models"),
@@ -171,6 +171,62 @@ def test_invalid_entries_are_refused_with_task_prefix(
     with pytest.raises(ManifestError, match=fragment) as info:
         load(root, TASK.replace(old, new))
     assert str(info.value).startswith("bench: ")
+
+
+@pytest.mark.parametrize("field", ["ollama_env", "model_env"])
+@pytest.mark.parametrize("name", PASTORE_SETS)
+def test_names_pastore_sets_are_refused_as_ollama_env_and_model_env(
+    tmp_path: Path, field: str, name: str
+) -> None:
+    entry = TASK.replace(f"{field}: {CURRENT[field]}", f"{field}: {name}")
+    with pytest.raises(ManifestError) as info:
+        load(make_root(tmp_path), entry)
+    message = str(info.value)
+    assert message.startswith(f"bench: {field} {name!r} may not")
+    assert all(reserved in message for reserved in PASTORE_SETS)
+    assert len(message.splitlines()) == 1
+
+
+def test_a_refused_ollama_env_does_not_add_a_second_env_error(tmp_path: Path) -> None:
+    entry = TASK.replace("ollama_env: OLLAMA_HOST", "ollama_env: PATH").replace(
+        "env: {MODE: fast}", "env: {PATH: x}"
+    )
+    with pytest.raises(ManifestError) as info:
+        load(make_root(tmp_path), entry)
+    lines = str(info.value).splitlines()
+    assert len(lines) == 1 and lines[0].startswith("bench: ollama_env 'PATH' may not")
+
+
+@pytest.mark.parametrize("name", ["OLLAMA_HOST", "PASTORE_MODEL", "SHARED_VAR"])
+def test_model_env_equal_to_ollama_env_is_refused(tmp_path: Path, name: str) -> None:
+    entry = TASK.replace(f"ollama_env: {CURRENT['ollama_env']}", f"ollama_env: {name}").replace(
+        f"model_env: {CURRENT['model_env']}", f"model_env: {name}"
+    )
+    with pytest.raises(ManifestError, match=f"^bench: model_env '{name}' may not be ollama_env"):
+        load(make_root(tmp_path), entry)
+
+
+def test_a_normal_ollama_env_and_model_env_pair_is_accepted(tmp_path: Path) -> None:
+    root = make_root(tmp_path)
+    spec = load_manifest(write(root, TASK), "torra", fake_which)["bench"]
+    assert (spec.ollama_env, spec.model_env) == ("OLLAMA_HOST", "PASTORE_MODEL")
+    near = TASK.replace("OLLAMA_HOST", "PATHS").replace("PASTORE_MODEL", "HOME_MODEL")
+    spec = load_manifest(write(root, near), "torra", fake_which)["bench"]
+    assert (spec.ollama_env, spec.model_env) == ("PATHS", "HOME_MODEL")
+
+
+@pytest.mark.parametrize("name", BASE_ENV_KEYS)
+def test_env_mapping_may_still_set_base_keys(tmp_path: Path, name: str) -> None:
+    entry = TASK.replace("env: {MODE: fast}", f"env: {{{name}: pinned}}")
+    spec = load_manifest(write(make_root(tmp_path), entry), "torra", fake_which)["bench"]
+    assert spec.env == {name: "pinned"}
+
+
+@pytest.mark.parametrize("name", RUN_DIR_ENV)
+def test_env_mapping_may_not_set_the_run_dir_names(tmp_path: Path, name: str) -> None:
+    entry = TASK.replace("env: {MODE: fast}", f"env: {{{name}: /x}}")
+    with pytest.raises(ManifestError, match=rf"^bench: env may not set \['{name}'\]"):
+        load(make_root(tmp_path), entry)
 
 
 def test_invalid_env_names_do_not_reserve_the_empty_key(tmp_path: Path) -> None:

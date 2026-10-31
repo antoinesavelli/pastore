@@ -34,7 +34,7 @@ def make_spec(tmp_path: Path) -> TaskSpec:
         argv=("unused",),
         cwd=tmp_path,
         env={},
-        models=(),
+        models=("first-model", "second-model"),
         timeout_s=3,
         ok_exit=frozenset({0}),
         ollama_env="MY_OLLAMA",
@@ -84,6 +84,20 @@ def test_contract_fails_a_job_that_exits_0_on_ollama_errors(tmp_path: Path) -> N
     )
     assert not result.passed
     assert all(s.exit_code == 0 and s.result_left and not s.passed for s in result.scenarios)
+
+
+def test_contract_runs_every_scenario_with_the_first_manifest_model(tmp_path: Path) -> None:
+    result = contract_for(
+        tmp_path,
+        """
+        import sys
+        (out.parent / "model.txt").write_text(os.environ["PASTORE_MODEL"])
+        sys.exit(0 if os.environ["PASTORE_MODEL"] == "first-model" else 3)
+        """,
+    )
+    assert all(s.exit_code == 0 for s in result.scenarios)
+    for s in result.scenarios:
+        assert (tmp_path / "runs" / s.run_id / "model.txt").read_text() == "first-model"
 
 
 def test_contract_passes_a_job_that_fails_loud(tmp_path: Path) -> None:

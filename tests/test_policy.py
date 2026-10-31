@@ -35,12 +35,14 @@ GOOD_DATA: dict[str, Any] = {
             "vram_gb": 24,
             "max_models": 3,
             "parallel": 3,
+            "context": 32768,
         },
         "executor": {
             "url": "http://192.0.2.101:11434",
             "vram_gb": 10,
             "max_models": 3,
             "parallel": 3,
+            "context": 8192,
         },
     },
     "sources": [
@@ -100,8 +102,8 @@ def write(tmp_path: Path, text: str) -> Path:
 def test_load_valid_policy(tmp_path: Path) -> None:
     policy = load_policy(write(tmp_path, GOOD))
     assert policy.hosts == {
-        "workstation": Host("workstation", "http://127.0.0.1:11435", 24, 3, 3),
-        "executor": Host("executor", "http://192.0.2.101:11434", 10, 3, 3),
+        "workstation": Host("workstation", "http://127.0.0.1:11435", 24, 3, 3, 32768),
+        "executor": Host("executor", "http://192.0.2.101:11434", 10, 3, 3, 8192),
     }
     assert [r.level for r in policy.sources] == [
         Level.HEARTH,
@@ -148,8 +150,8 @@ def test_two_models_of_one_task_are_two_pairs() -> None:
 def test_repo_policy_v2_loads_and_round_trips_byte_for_byte() -> None:
     policy = load_policy(REPO_POLICY)
     assert policy.hosts == {
-        "workstation": Host("workstation", "http://127.0.0.1:11435", 24, 3, 3),
-        "executor": Host("executor", "http://127.0.0.1:11436", 10, 3, 3),
+        "workstation": Host("workstation", "http://127.0.0.1:11435", 24, 3, 3, 32768),
+        "executor": Host("executor", "http://127.0.0.1:11436", 10, 3, 3, 8192),
     }
     assert policy.sources == (
         SourceRule(Level.HEARTH, "cgroup", ("pastore-*.scope",)),
@@ -166,9 +168,9 @@ def test_repo_policy_v2_loads_and_round_trips_byte_for_byte() -> None:
 
 def rich_policy() -> Policy:
     hosts = {
-        "workstation": Host("workstation", "http://127.0.0.1:11435", 24, 3, 3),
-        "executor": Host("executor", "http://192.0.2.101:11434", 10, 3, 3),
-        "off": Host("off", "http://[::1]:11437", 16, 1, 4),
+        "workstation": Host("workstation", "http://127.0.0.1:11435", 24, 3, 3, 32768),
+        "executor": Host("executor", "http://192.0.2.101:11434", 10, 3, 3, 8192),
+        "off": Host("off", "http://[::1]:11437", 16, 1, 4, 16384),
     }
     sources = (
         SourceRule(Level.HEARTH, "cgroup", ("pastore-*.scope",)),
@@ -202,6 +204,33 @@ def test_render_round_trips(variant: str) -> None:
     text = render_policy(policy)
     assert parse_policy(text) == policy
     assert render_policy(parse_policy(text)) == text
+
+
+def test_render_writes_context_after_parallel_and_keeps_it() -> None:
+    policy = rich_policy()
+    text = render_policy(policy)
+    assert "parallel: 4, context: 16384}" in text and "parallel: 3, context: 32768}" in text
+    assert {h.name: h.context for h in parse_policy(text).hosts.values()} == {
+        "workstation": 32768,
+        "executor": 8192,
+        "off": 16384,
+    }
+
+
+def test_missing_context_is_reported_with_every_other_host_problem() -> None:
+    data = copy.deepcopy(GOOD_DATA)
+    del data["hosts"]["workstation"]["context"]
+    data["hosts"]["workstation"]["parallel"] = 0
+    data["hosts"]["executor"]["vram_gb"] = 0
+    with pytest.raises(PolicyError) as info:
+        parse_policy(yaml.safe_dump(data, sort_keys=False))
+    message = str(info.value)
+    for fragment in (
+        "host 'workstation': missing key 'context'",
+        "host 'workstation': parallel must be a positive int",
+        "host 'executor': vram_gb must be a positive int",
+    ):
+        assert fragment in message
 
 
 def test_render_escapes_unicode_quotes_backslashes_and_controls_as_ascii() -> None:
@@ -275,6 +304,12 @@ BAD_EDITS: list[tuple[tuple[str | int, ...], object, str]] = [
     (("hosts", "executor", "vram_gb"), True, "host 'executor': vram_gb must be a positive int"),
     (("hosts", "executor", "max_models"), -1, "host 'executor': max_models must be a positive int"),
     (("hosts", "executor", "parallel"), 1.5, "host 'executor': parallel must be a positive int"),
+    (("hosts", "executor", "context"), DELETE, "host 'executor': missing key 'context'"),
+    (("hosts", "executor", "context"), 0, "host 'executor': context must be a positive int"),
+    (("hosts", "executor", "context"), -8192, "host 'executor': context must be a positive int"),
+    (("hosts", "executor", "context"), True, "host 'executor': context must be a positive int"),
+    (("hosts", "executor", "context"), "8192", "host 'executor': context must be a positive int"),
+    (("hosts", "executor", "context"), 8192.0, "host 'executor': context must be a positive int"),
     (("sources",), [], "sources must be a non-empty list"),
     (("sources",), "hearth", "sources must be a non-empty list"),
     (("sources", 3), "claude", "sources[3] must be a mapping"),
