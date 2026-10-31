@@ -341,13 +341,23 @@ class _UniqueKeyLoader(yaml.SafeLoader):
         return mapping
 
 
+# What PyYAML's constructors and the validators' own messages raise on crafted input: nested too deep, an int over
+# 4300 digits, a bad explicit tag. None of it may stall the dispatcher's tick or stop the gateway from starting.
+_CRAFTED = (RecursionError, ValueError, TypeError, KeyError, AttributeError, IndexError)
+
+
 def parse_policy(text: str) -> Policy:
     """Validate policy text; raise PolicyError listing every problem found."""
     try:
-        data = yaml.load(text, Loader=_UniqueKeyLoader)
-    # RecursionError: nested too deep. ValueError: an int over 4300 digits. Neither may stall the dispatcher's tick.
-    except (yaml.YAMLError, RecursionError, ValueError) as exc:
+        return _parse(text)
+    except yaml.YAMLError as exc:
         raise PolicyError(f"invalid YAML: {exc}") from exc
+    except _CRAFTED as exc:
+        raise PolicyError(f"invalid policy: {type(exc).__name__}: {exc}") from exc
+
+
+def _parse(text: str) -> Policy:
+    data = yaml.load(text, Loader=_UniqueKeyLoader)
     if not isinstance(data, dict):
         raise PolicyError("policy must be a mapping with version, hosts, sources, consumers, jobs")
     problems = [f"unknown key {k!r}" for k in data if k not in KEYS]

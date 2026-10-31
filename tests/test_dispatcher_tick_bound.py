@@ -532,6 +532,36 @@ def test_a_newer_run_now_for_another_pair_survives_the_start_of_the_first(
     assert clears == [("c/a", MODEL), ("c/b", MODEL)]  # each clear names the pair it acted on
 
 
+def test_a_newer_run_now_for_another_pair_survives_the_refusal_of_the_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    specs = [
+        task(tmp_path, "a", ready=Ready(3600, ("./ready",))),
+        task(tmp_path, "b", ready=Ready(3600, ("./ready",))),
+    ]
+    rig = rig_with(tmp_path, specs)
+    rig.reader_rc["./ready"] = 1  # neither pair is ready by itself
+    real = rig.state.record_event
+
+    def newer_on_refusal(
+        now: datetime, kind: str, ref: str | None = None, detail: str = ""
+    ) -> None:
+        if kind == "refused":  # between the read of the request and its clear
+            with contextlib.closing(open_state(rig.paths)) as other:
+                other.request_run_now("c/b", MODEL)
+        real(now, kind, ref, detail)
+
+    monkeypatch.setattr(rig.state, "record_event", newer_on_refusal)
+    rig.state.request_run_now("c/unlisted", MODEL)
+    rig.tick()
+    [refused] = rig.events("refused")
+    assert refused.ref == "c/unlisted" and rig.handles == []
+    assert rig.state.run_now_requested() == ("c/b", MODEL)
+    rig.tick()
+    assert [e.ref for e in rig.events("run-start")] == ["c/b"] and len(rig.events("refused")) == 1
+    assert rig.state.run_now_requested() is None
+
+
 def test_a_forced_start_that_outlives_the_bound_still_clears_the_request(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -562,21 +592,53 @@ def test_a_forced_start_that_outlives_the_bound_still_clears_the_request(
     drive.run(on_nap)
 
 
-PATHOLOGICAL = {
-    "nested-too-deep": "version: 2\nhosts: " + "[" * 3000 + "]" * 3000 + "\n",
-    "int-over-4300-digits": "version: 2\nsize: " + "9" * 5000 + "\n",
+HEX_INT = (
+    "0x" + "1" * 4000
+)  # 4817 decimal digits: any message that shows it with !r raises ValueError
+SEXAGESIMAL_INT = "1" + ":0" * 2500  # 60 ** 2500, over 4300 digits as well
+
+
+def swap(old: str, new: str) -> Callable[[str], str]:
+    """An edit of a valid policy text: the first `old` becomes `new`."""
+
+    def edit(base: str) -> str:
+        assert old in base
+        return base.replace(old, new, 1)
+
+    return edit
+
+
+PATHOLOGICAL: dict[str, Callable[[str], str]] = {
+    "nested-too-deep": lambda _base: "version: 2\nhosts: " + "[" * 3000 + "]" * 3000 + "\n",
+    "int-over-4300-digits": lambda _base: "version: 2\nsize: " + "9" * 5000 + "\n",
+    "version-bool-tag": swap("version: 2", "version: !!bool foo"),
+    "version-timestamp-tag": swap("version: 2", "version: !!timestamp foo"),
+    "version-empty-int-tag": swap("version: 2", "version: !!int ''"),
+    "version-empty-float-tag": swap("version: 2", "version: !!float ''"),
+    "version-map-tag-on-a-sequence": swap("version: 2", "version: !!map [1]"),
+    "version-impossible-date": swap("version: 2", "version: 2026-13-45"),
+    "version-float-tag-on-text": swap("version: 2", "version: !!float 'x'"),
+    "version-hex": swap("version: 2", f"version: {HEX_INT}"),
+    "version-sexagesimal": swap("version: 2", f"version: {SEXAGESIMAL_INT}"),
+    "level-hex": swap("level: hearth", f"level: {HEX_INT}"),
+    "level-sexagesimal": swap("level: hearth", f"level: {SEXAGESIMAL_INT}"),
+    "cgroup-hex": swap('cgroup: ["pastore-*.scope"]', f"cgroup: [{HEX_INT}]"),
+    "cgroup-sexagesimal": swap('cgroup: ["pastore-*.scope"]', f"cgroup: [{SEXAGESIMAL_INT}]"),
+    "consumer-path-hex": swap("  c: ", f"  c: {HEX_INT} # "),
+    "consumer-path-sexagesimal": swap("  c: ", f"  c: {SEXAGESIMAL_INT} # "),
 }
 
 
-@pytest.mark.parametrize("text", PATHOLOGICAL.values(), ids=PATHOLOGICAL)
-def test_a_pathological_policy_is_a_policy_error(text: str) -> None:
-    with pytest.raises(PolicyError, match="invalid YAML"):
-        parse_policy(text)
+@pytest.mark.parametrize("name", PATHOLOGICAL)
+def test_a_pathological_policy_is_a_policy_error(tmp_path: Path, name: str) -> None:
+    rig = rig_with(tmp_path, [task(tmp_path, "a")])
+    with pytest.raises(PolicyError, match="^invalid (YAML|policy)"):
+        parse_policy(PATHOLOGICAL[name](rig.policy.read_text()))
 
 
-@pytest.mark.parametrize("text", PATHOLOGICAL.values(), ids=PATHOLOGICAL)
+@pytest.mark.parametrize("name", PATHOLOGICAL)
 def test_a_pathological_policy_neither_stalls_the_tick_nor_loses_the_last_good_policy(
-    tmp_path: Path, text: str
+    tmp_path: Path, name: str
 ) -> None:
     rig = rig_with(tmp_path, [task(tmp_path, "a")])
     logged: list[str] = []
@@ -585,7 +647,7 @@ def test_a_pathological_policy_neither_stalls_the_tick_nor_loses_the_last_good_p
     rig.tick()
     good = rig.d.policy.current()
     assert len(rig.handles) == 1 and logged == []
-    rig.policy.write_text(text)
+    rig.policy.write_text(PATHOLOGICAL[name](rig.policy.read_text()))
     rig.state.request_stop("now")
     assert rig.tick() is False  # the stop is honoured on the first tick after the bad edit
     assert rig.handles[0].stopped and rig.d.active == {}
