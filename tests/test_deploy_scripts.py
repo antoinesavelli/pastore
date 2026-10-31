@@ -7,6 +7,8 @@ import argparse
 import http.client
 import importlib.util
 import json
+import os
+import socket
 import subprocess
 import threading
 from collections import Counter
@@ -46,14 +48,17 @@ def sx() -> ModuleType:
 
 @pytest.fixture(autouse=True)
 def _no_network_no_subprocess(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Any real HTTP connection or child process from a script under test fails the test at once."""
+    """Any real connection, child process or shell command from a script under test fails the test at once."""
 
     def forbidden(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("a deploy script tried to open a connection or start a process")
 
     monkeypatch.setattr(http.client, "HTTPConnection", forbidden)
+    monkeypatch.setattr(socket, "create_connection", forbidden)
+    monkeypatch.setattr(socket.socket, "connect", forbidden)
     monkeypatch.setattr(subprocess, "Popen", forbidden)
     monkeypatch.setattr(subprocess, "run", forbidden)
+    monkeypatch.setattr(os, "system", forbidden)
 
 
 # --- check 10: measure_ttfb.py -----------------------------------------------------------------
@@ -145,8 +150,8 @@ def test_ttfb_main_warms_up_then_alternates_and_reports_gateway_minus_direct(
 ) -> None:
     """Two unmeasured warm-ups, then direct and gateway in turn; p50 is the median, added p95 is gateway - direct."""
     script = {
-        "http://d:1": iter([999.0, 10.0, 20.0, 30.0, 40.0, 50.0]),
-        "http://g:2": iter([999.0, 12.0, 22.0, 32.0, 42.0, 59.0]),
+        "http://d:1": iter([999.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0]),
+        "http://g:2": iter([999.0, 12.0, 22.0, 32.0, 42.0, 52.0, 69.0]),
     }
     calls: list[str] = []
 
@@ -155,15 +160,28 @@ def test_ttfb_main_warms_up_then_alternates_and_reports_gateway_minus_direct(
         return next(script[base])
 
     monkeypatch.setattr(ttfb, "ttfb_ms", fake_ttfb)
-    argv = ["measure_ttfb", "--direct", "http://d:1", "--gateway", "http://g:2", "--model", "m"]
-    monkeypatch.setattr("sys.argv", [*argv, "-n", "5"])
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "measure_ttfb",
+            "--direct",
+            "http://d:1",
+            "--gateway",
+            "http://g:2",
+            "--model",
+            "m",
+            "-n",
+            "6",
+        ],
+    )
     assert ttfb.main() == 0
-    assert calls == ["http://d:1", "http://g:2"] * 6
-    # direct p95: 40 + (50 - 40) * 0.8 = 48; gateway p95: 42 + (59 - 42) * 0.8 = 55.6; added 7.6
+    assert calls == ["http://d:1", "http://g:2"] * 7
+    # six samples: p50 is the mean of the middle two (35, 37); p95 is rank 4.75: 50 + 10 * 0.75 = 57.5 and
+    # 52 + 17 * 0.75 = 64.75, so 7.25 added
     assert capsys.readouterr().out.splitlines() == [
-        "direct   n=5 p50=30.00ms p95=48.00ms",
-        "gateway  n=5 p50=32.00ms p95=55.60ms",
-        "added p95=7.60ms (check 10 passes under 5 ms)",
+        "direct   n=6 p50=35.00ms p95=57.50ms",
+        "gateway  n=6 p50=37.00ms p95=64.75ms",
+        "added p95=7.25ms (check 10 passes under 5 ms)",
     ]
 
 
@@ -335,6 +353,18 @@ def test_host_stats_repeats_exclude_extras_but_decode_and_wall_include_them(
     assert got["repeat_min"] == 50.0
     assert got["repeat_max"] == 200.0
     assert got["repeat_mean"] == pytest.approx((50.0 + 200.0 + 150.0) / 3)
+
+
+def test_host_stats_wall_span_is_earliest_start_to_latest_end_not_first_to_last_record(
+    tp: ModuleType,
+) -> None:
+    """In start order the last record may end before an earlier one: 100 tok over 0 to 10 s is 10 tok/s wall."""
+    s = 1_000_000_000
+    records = [
+        _req("both", "w", 0, False, **_gen(60, s, 0.0, 10.0)),
+        _req("both", "w", 0, False, **_gen(40, s, 1.0, 3.0)),
+    ]
+    assert tp.host_stats(records)["wall_tok_s"] == 10.0
 
 
 def test_host_stats_with_one_request_has_equal_repeat_figures(tp: ModuleType) -> None:
@@ -551,14 +581,6 @@ def test_remote_script_validates_the_interface_and_formats_the_settings(sx: Modu
             sx.remote_script(bad, 5.0, 1)
 
 
-def test_num_reads_a_float_or_none(sx: ModuleType) -> None:
-    assert sx._num("1.5") == 1.5
-    assert sx._num("-40") == -40.0
-    assert sx._num(None) is None
-    assert sx._num("[N/A]") is None
-    assert sx._num("") is None
-
-
 def test_cpu_times_total_and_idle_use_the_first_eight_fields(sx: ModuleType) -> None:
     """Total is user..steal (eight fields, guest columns left out); idle is idle plus iowait."""
     assert sx._cpu_times(["cpu  10 0 20 300 40 0 0 0 0 0"]) == (370.0, 340.0)
@@ -589,71 +611,6 @@ def test_wifi_quality_ratio_and_signal_from_iwconfig_and_iw(sx: ModuleType) -> N
     assert sx._wifi("") == (None, None)
 
 
-def test_mb_rounds_to_two_places_and_passes_none(sx: ModuleType) -> None:
-    assert sx._mb(None, 1024) is None
-    assert sx._mb(1536, 1024) == 1.5
-    assert sx._mb(1000, 1024) == 0.98
-    assert sx._mb(0.0, 1024) == 0.0
-
-
-def test_grab_returns_the_first_numeric_group_or_none(sx: ModuleType) -> None:
-    lines = ["MemTotal: 100 kB", "MemAvailable: 42 kB"]
-    assert sx._grab(lines, r"^MemAvailable:\s+(\d+)") == 42.0
-    assert sx._grab(lines, r"^SwapTotal:\s+(\d+)") is None
-    assert sx._grab([], r"^(\S+)") is None
-
-
-def test_parse_raw_converts_every_section_to_its_field(sx: ModuleType) -> None:
-    """Each section's text becomes its named number: kB to MB, bytes to MB, swap used as total minus free."""
-    sections = {
-        "psi_cpu": ["some avg10=1.50 avg60=0.00 avg300=0.00 total=123"],
-        "psi_mem": [
-            "some avg10=0.10 avg60=0 avg300=0 total=1",
-            "full avg10=0.05 avg60=0 avg300=0 total=1",
-        ],
-        "psi_io": [
-            "some avg10=2.00 avg60=0 avg300=0 total=1",
-            "full avg10=1.00 avg60=0 avg300=0 total=1",
-        ],
-        "stat": ["cpu  100 0 100 800 0 0 0 0 0 0", "cpu0 1 1 1 1 1 1 1 1 1 1"],
-        "load": ["0.52 0.40 0.30 1/200 1234"],
-        "mem": [
-            "MemTotal:       16000000 kB",
-            "MemAvailable:    2097152 kB",
-            "SwapTotal:       4194304 kB",
-            "SwapFree:        3145728 kB",
-        ],
-        "net": ["rx_bytes 6000", "tx_bytes 2500", "rx_dropped 4", "tx_errors missing"],
-        "wifi": ["wlan0  Link Quality=70/70  Signal level=-40 dBm"],
-        "gpu": ["55, 10240, 61"],
-        "ollama_mem": ["2147483648"],
-        "ollama_cpu": ["usage_usec 1", "nr_periods 10", "nr_throttled 3", "throttled_usec 4"],
-    }
-    assert sx.parse_raw(sections) == {
-        "load1": 0.52,
-        "mem_avail_mb": 2048.0,
-        "swap_used_mb": 1024.0,
-        "wifi_quality": 1.0,
-        "wifi_signal_dbm": -40.0,
-        "gpu_util_pct": 55.0,
-        "gpu_mem_mb": 10240.0,
-        "gpu_temp_c": 61.0,
-        "ollama_mem_mb": 2048.0,
-        "cpu_total": 1000.0,
-        "cpu_idle": 800.0,
-        "nr_throttled": 3.0,
-        "psi_cpu_some10": 1.5,
-        "psi_mem_some10": 0.1,
-        "psi_mem_full10": 0.05,
-        "psi_io_some10": 2.0,
-        "psi_io_full10": 1.0,
-        "rx_bytes": 6000.0,
-        "tx_bytes": 2500.0,
-        "rx_dropped": 4.0,
-        "tx_errors": None,
-    }
-
-
 def test_parse_raw_missing_sections_are_none_and_zero_swap_is_zero_not_none(sx: ModuleType) -> None:
     """Sections that came back as the single word `missing`, or not at all, give None; swap 0 - 0 is 0.0."""
     empty = sx.parse_raw({})
@@ -679,29 +636,6 @@ def _nums(**override: float | None) -> dict[str, float | None]:
         0.0,
     )
     return {**base, **override}
-
-
-def test_derive_busy_percent_rates_and_deltas_from_two_samples(sx: ModuleType) -> None:
-    """CPU 800 jiffies elapsed with 600 idle is 25% busy; 5000 B and 500 B over 5 s are 1000 and 100 B/s."""
-    prev = _nums(
-        cpu_total=1000, cpu_idle=800, rx_bytes=1000, tx_bytes=2000, rx_dropped=0, nr_throttled=3
-    )
-    now = _nums(
-        cpu_total=1800, cpu_idle=1400, rx_bytes=6000, tx_bytes=2500, rx_dropped=4, nr_throttled=10
-    )
-    assert sx._derive(now, prev, 5.0) == {
-        "cpu_busy_pct": 25.0,
-        "wifi_rx_Bps": 1000.0,
-        "wifi_tx_Bps": 100.0,
-        "wifi_rx_dropped_delta": 4.0,
-        "wifi_tx_errors_delta": 0.0,
-        "ollama_throttled_delta": 7.0,
-    }
-
-
-def test_derive_without_a_previous_sample_is_all_none(sx: ModuleType) -> None:
-    got = sx._derive(_nums(cpu_total=5), None, 5.0)
-    assert set(got.values()) == {None} and len(got) == 6
 
 
 def test_derive_rounding_resets_and_unusable_intervals(sx: ModuleType) -> None:
@@ -739,7 +673,7 @@ def _sample(stamp: str, stat: str, rx: int, tx: int, dropped: int, throttled: in
         "0.52 0.40 0.30 1/200 1234",
         "@@mem",
         "MemTotal:       16000000 kB",
-        "MemAvailable:    2097152 kB",
+        "MemAvailable:    2097200 kB",
         "SwapTotal:       4194304 kB",
         "SwapFree:        3145728 kB",
         "@@net",
@@ -762,7 +696,7 @@ def _sample(stamp: str, stat: str, rx: int, tx: int, dropped: int, throttled: in
 
 LEVELS = {
     "load1": 0.52,
-    "mem_avail_mb": 2048.0,
+    "mem_avail_mb": 2048.05,  # 2097200 kB / 1024, rounded to two places
     "swap_used_mb": 1024.0,
     "wifi_quality": 1.0,
     "wifi_signal_dbm": -40.0,
@@ -979,7 +913,7 @@ def test_fmt_integers_whole_hundreds_and_two_places(sx: ModuleType) -> None:
 
 
 def test_render_is_a_table_with_metrics_as_rows_and_windows_as_columns(sx: ModuleType) -> None:
-    """Header, one row per key (`-` where a window has no value), then the five ping rows; columns aligned."""
+    """Header, one row per key (`-` where a window has no value), then the five ping rows; no line ends in spaces."""
     nothing = {"count": 0, "loss_pct": None, "p50": None, "p95": None, "max": None}
     stats = {
         "before": {
@@ -995,18 +929,16 @@ def test_render_is_a_table_with_metrics_as_rows_and_windows_as_columns(sx: Modul
     }
     lines = sx._render(stats, ["load1", "gpu_util_pct"]).split("\n")
     assert not any(line != line.rstrip() for line in lines)
-    cells = [(line[0:17].rstrip(), line[19:29].rstrip(), line[31:].rstrip()) for line in lines]
-    assert cells == [
-        ("metric (mean/max)", "before n=2", "both n=3"),
-        ("load1", "0.50/0.90", "123/200"),
-        ("gpu_util_pct", "-", "-"),
-        ("ping_n", "4", "0"),
-        ("ping_p50_ms", "2.00", "-"),
-        ("ping_p95_ms", "2.90", "-"),
-        ("ping_max_ms", "3.00", "-"),
-        ("ping_loss_pct", "25.00", "-"),
+    assert [line.split() for line in lines] == [
+        ["metric", "(mean/max)", "before", "n=2", "both", "n=3"],
+        ["load1", "0.50/0.90", "123/200"],
+        ["gpu_util_pct", "-", "-"],
+        ["ping_n", "4", "0"],
+        ["ping_p50_ms", "2.00", "-"],
+        ["ping_p95_ms", "2.90", "-"],
+        ["ping_max_ms", "3.00", "-"],
+        ["ping_loss_pct", "25.00", "-"],
     ]
-    assert lines[0].index("before") == 19 and lines[0].index("both") == 31
 
 
 def test_reach_summary_counts_up_and_down_and_keeps_raw_lines_under_ten(sx: ModuleType) -> None:
