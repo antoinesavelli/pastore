@@ -1,8 +1,9 @@
-"""The gateway entry point and its interim policy: refuses a bad policy, wires hang-up cancellation, mirrors policy-v2.
+"""The gateway entry point and its unit: refuses a bad policy, wires hang-up cancellation, points at policy.yaml.
 
-Depends on: pastore.gateway.__main__, pastore.policy, deploy/gateway-policy.yaml and policy-v2.yaml.
+Depends on: pastore.gateway.__main__, pastore.policy, deploy/pastore-gateway.service and the repo's policy.yaml.
 """
 
+import shlex
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +14,8 @@ from pastore.gateway import __main__ as entry
 from pastore.policy import load_policy
 
 ROOT = Path(__file__).resolve().parent.parent
-GATEWAY_POLICY = ROOT / "deploy" / "gateway-policy.yaml"
+REPO_POLICY = ROOT / "policy.yaml"
+UNIT = ROOT / "deploy" / "pastore-gateway.service"
 
 
 def test_refuses_a_v1_policy(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -32,18 +34,17 @@ def test_serves_with_handler_cancellation(monkeypatch: pytest.MonkeyPatch) -> No
         seen.update(kwargs, app=app)
 
     monkeypatch.setattr(entry.web, "run_app", fake_run_app)
-    assert entry.main(["--policy", str(GATEWAY_POLICY), "--host", "127.0.0.1", "--port", "0"]) == 0
+    assert entry.main(["--policy", str(REPO_POLICY), "--host", "127.0.0.1", "--port", "0"]) == 0
     assert isinstance(seen["app"], web.Application)
     assert (seen["host"], seen["port"], seen["handler_cancellation"]) == ("127.0.0.1", 0, True)
 
 
-def test_gateway_policy_mirrors_policy_v2() -> None:
-    """The interim gateway policy has policy-v2's sources and hosts; only the workstation's slot counts may differ."""
-    gateway, v2 = load_policy(GATEWAY_POLICY), load_policy(ROOT / "policy-v2.yaml")
-    assert gateway.sources == v2.sources
-    assert gateway.hosts.keys() == v2.hosts.keys()
-    for name, host in gateway.hosts.items():
-        mirrored = (host.url, host.vram_gb, host.context)
-        same = mirrored == (v2.hosts[name].url, v2.hosts[name].vram_gb, v2.hosts[name].context)
-        assert same and (name == "workstation" or host == v2.hosts[name])
-    assert gateway.jobs == ()
+def test_unit_policy_argument_is_the_repo_policy_yaml() -> None:
+    """The unit's --policy names policy.yaml under its WorkingDirectory, and load_policy accepts that file."""
+    lines = {k: v for k, _, v in (line.partition("=") for line in UNIT.read_text().splitlines())}
+    argv = shlex.split(lines["ExecStart"])
+    arg = Path(argv[argv.index("--policy") + 1])
+    assert arg.is_absolute()
+    assert arg.relative_to(lines["WorkingDirectory"]) == Path("policy.yaml")
+    policy = load_policy(ROOT / arg.relative_to(lines["WorkingDirectory"]))
+    assert {"workstation", "executor"} <= policy.hosts.keys()

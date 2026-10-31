@@ -10,7 +10,7 @@ OnFailure=unit-failed@%n.service
 [Service]
 Type=simple
 WorkingDirectory=/srv/projects/pastore
-ExecStart=/srv/projects/pastore/.venv/bin/python -m pastore.gateway --policy /srv/projects/pastore/deploy/gateway-policy.yaml --host 0.0.0.0 --port 11434
+ExecStart=/srv/projects/pastore/.venv/bin/python -m pastore.gateway --policy /srv/projects/pastore/policy.yaml --host 0.0.0.0 --port 11434
 Restart=always
 RestartSec=1
 MemoryMax=2G

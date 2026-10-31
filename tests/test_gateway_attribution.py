@@ -1,6 +1,6 @@
 """Gateway attribution (R21, R22): peer rules, the /proc lookup in a fake /proc, the budget, the pid cache, real /proc.
 
-Depends on: pastore.gateway.attribution, pastore.policy (the real policy-v2.yaml rules), pastore.spec.
+Depends on: pastore.gateway.attribution, pastore.policy (the real policy.yaml rules), pastore.spec.
 """
 
 import ipaddress
@@ -21,8 +21,8 @@ from pastore.policy import load_policy
 from pastore.spec import UNKNOWN_LEVEL, Level, SourceRule
 
 UID = os.getuid()
-POLICY_V2 = Path(__file__).resolve().parent.parent / "policy-v2.yaml"
-RULES = load_policy(POLICY_V2).sources
+REPO_POLICY = Path(__file__).resolve().parent.parent / "policy.yaml"
+RULES = load_policy(REPO_POLICY).sources
 LOCAL: Address = ("127.0.0.1", 11434)
 SESSION = "0::/user.slice/user-1000.slice/session-3.scope"
 HEARTH = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/pastore-r123.scope"

@@ -25,7 +25,7 @@ from pastore.policy import (
 )
 from pastore.spec import Host, Level, Pair, SourceRule
 
-REPO_POLICY = Path(__file__).resolve().parent.parent / "policy-v2.yaml"
+REPO_POLICY = Path(__file__).resolve().parent.parent / "policy.yaml"
 BENCH_SHA = hashlib.sha256(b"bench").hexdigest()
 GOOD_DATA: dict[str, Any] = {
     "version": 2,
