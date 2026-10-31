@@ -66,9 +66,7 @@ def job_env(
     """The explicit job environment: base keys, manifest env, the run dir, the Ollama URL, the model."""
     env = {key: base[key] for key in BASE_ENV_KEYS if key in base}
     env.update(spec.env)
-    # FUCONE_RUN_DIR: compatibility until consumers read PASTORE_RUN_DIR (R31)
-    for name in RUN_DIR_ENV:
-        env[name] = str(run_dir.out)
+    env[RUN_DIR_ENV] = str(run_dir.out)
     env[spec.ollama_env] = ollama_url
     env[spec.model_env] = model
     return env

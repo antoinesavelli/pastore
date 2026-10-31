@@ -23,7 +23,7 @@ TASK = """  - id: bench
     reader: {run: [.venv/bin/python, read.py]}
 """
 OTHER = TASK.replace("id: bench", "id: second")
-PASTORE_SETS = (*BASE_ENV_KEYS, *RUN_DIR_ENV)
+PASTORE_SETS = (*BASE_ENV_KEYS, RUN_DIR_ENV)
 CURRENT = {"ollama_env": "OLLAMA_HOST", "model_env": "PASTORE_MODEL"}
 
 
@@ -149,7 +149,6 @@ def test_fingerprint_is_per_task_entry(tmp_path: Path) -> None:
         ("timeout: 2h", "timeout: 2d", "duration"),
         ("kind: eval", "kind: ''", "kind"),
         ("env: {MODE: fast}", "env: {PASTORE_RUN_DIR: /x}", "PASTORE_RUN_DIR"),
-        ("env: {MODE: fast}", "env: {FUCONE_RUN_DIR: /x}", "FUCONE_RUN_DIR"),
         ("env: {MODE: fast}", "env: {OLLAMA_HOST: x}", "OLLAMA_HOST"),
         ("env: {MODE: fast}", "env: {MODE: 1}", "string to string"),
         ("kind: eval", "kind: eval\n    surprise: 1", "unknown key 'surprise'"),
@@ -222,10 +221,9 @@ def test_env_mapping_may_still_set_base_keys(tmp_path: Path, name: str) -> None:
     assert spec.env == {name: "pinned"}
 
 
-@pytest.mark.parametrize("name", RUN_DIR_ENV)
-def test_env_mapping_may_not_set_the_run_dir_names(tmp_path: Path, name: str) -> None:
-    entry = TASK.replace("env: {MODE: fast}", f"env: {{{name}: /x}}")
-    with pytest.raises(ManifestError, match=rf"^bench: env may not set \['{name}'\]"):
+def test_env_mapping_may_not_set_the_run_dir_name(tmp_path: Path) -> None:
+    entry = TASK.replace("env: {MODE: fast}", f"env: {{{RUN_DIR_ENV}: /x}}")
+    with pytest.raises(ManifestError, match=rf"^bench: env may not set \['{RUN_DIR_ENV}'\]"):
         load(make_root(tmp_path), entry)
 
 

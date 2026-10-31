@@ -24,6 +24,7 @@ from pastore.policy import Policy, PolicyCache
 from pastore.runner import RunDir, Runner, fresh_run_dir, stop_leftovers
 from pastore.spec import (
     BASE_ENV_KEYS,
+    RUN_DIR_ENV,
     WORKSTATION,
     RunReader,
     TaskSpec,
@@ -212,9 +213,7 @@ class Dispatcher:
 
     def _read(self, active: Active, now: datetime, job: JobRow, code: int) -> None:
         spec = active.spec
-        out = str(active.run_dir.out)
-        # FUCONE_RUN_DIR: compatibility until consumers read PASTORE_RUN_DIR (R31)
-        env = {**self._env(spec), "PASTORE_RUN_DIR": out, "FUCONE_RUN_DIR": out}
+        env = {**self._env(spec), RUN_DIR_ENV: str(active.run_dir.out)}
         reader_rc = self.deps.run_in(spec.reader.argv, spec.cwd, env).returncode
         if reader_rc != 0 or not isinstance(spec.reader, RunReader):
             status = "reader-failed" if reader_rc != 0 else "awaiting-review"
@@ -240,7 +239,8 @@ class Dispatcher:
         self, active: Active, now: datetime, status: str, code: int | None, detail: str = ""
     ) -> None:
         run = self.state.get_run(active.run_id)
-        assert run is not None
+        if run is None:
+            raise RuntimeError(f"run {active.run_id} has no state row")
         ended = replace(run, status=status, ended_at=iso(now), exit_code=code, detail=detail)
         self.state.update_run(ended)
         text = f"{active.run_id} {status} {code}" + (f" {detail}" if detail else "")
@@ -255,7 +255,7 @@ class Dispatcher:
         forced = self._run_now(now, units)
         ready = [] if forced is None else [forced]
         ready += [u for u in units if u is not forced and self._is_ready(now, *u)]
-        reason = self._gate(ready, policy)
+        reason = self._gate(ready)
         placed = 0
         if reason is None:
             states = self._read_hosts(policy, ready)
@@ -289,13 +289,13 @@ class Dispatcher:
     def _refuse_run_now(self, now: datetime, unit: Unit, reason: str) -> None:
         self.state.record_event(now, "refused", unit[0].ref, f"{unit[1]}: run-now: {reason}")
 
-    def _gate(self, ready: list[Unit], policy: Policy) -> str | None:
+    def _gate(self, ready: list[Unit]) -> str | None:
         """The idle reason that keeps every ready unit waiting, or None when placement may go on."""
         if stopped(self.deps.paths.stop_file):
             return idle_reason("stopped")
         if not ready:
             return idle_reason("no-ready-task")
-        return host_idle_reason(self.deps.host, policy.hosts[WORKSTATION].url)
+        return host_idle_reason(self.deps.host, self.deps.ollama_url)
 
     def _read_hosts(self, policy: Policy, ready: list[Unit]) -> list[HostState]:
         """Every policy host's facts for the ready units' models and the held ones; refreshes `loaded_seen`."""
@@ -407,7 +407,8 @@ class Dispatcher:
         return job
 
     def _check(self, job: JobRow, now: datetime, spec: TaskSpec) -> JobRow:
-        assert spec.ready is not None
+        if spec.ready is None:
+            raise RuntimeError(f"{spec.ref} has no ready check")
         every = timedelta(seconds=spec.ready.every_s)
         if (
             job.last_check_at is not None

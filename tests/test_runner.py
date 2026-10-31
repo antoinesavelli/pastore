@@ -66,7 +66,6 @@ def test_invariant_job_env_has_run_dir_and_no_leaked_vars(tmp_path: Path) -> Non
         "XDG_RUNTIME_DIR": "/run/user/1000",
         "MODE": "x",
         "PASTORE_RUN_DIR": str(run_dir.out),
-        "FUCONE_RUN_DIR": str(run_dir.out),
         "OLLAMA_HOST": "http://127.0.0.1:1",
         "PASTORE_MODEL": "m1",
     }

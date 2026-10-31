@@ -147,8 +147,9 @@ def host(
     module: str = "580.178.04",
     apps: str = "1, /usr/bin/cosmic-monitor\n",
     seen: list[str] | None = None,
+    refused: set[str] | None = None,
 ) -> Host:
-    """The workstation seams; `seen` collects the URL of every HTTP status check."""
+    """The workstation seams; `seen` collects the URL of every HTTP status check, `refused` names endpoints that refuse."""
     runner = RecordingRunner(
         {
             "dpkg-query": RecordingRunner.ok("580.178.04-0ubuntu0.24.04.1"),
@@ -162,6 +163,8 @@ def host(
     def http_status(url: str, _timeout_s: float) -> int:
         if seen is not None:
             seen.append(url)
+        if refused and url.partition("/api/")[0] in refused:
+            raise OSError(f"{url} refused")
         return 200
 
     return Host(run=runner, read_text=read_text, http_status=http_status)
@@ -522,7 +525,7 @@ def test_readers_and_checks_get_no_dispatcher_secrets(tmp_path: Path) -> None:
     check_env, reader_env = rig.run_in_envs[0], rig.run_in_envs[-1]
     assert check_env == {"PATH": "/usr/bin", "MODEL": "m"}
     assert "SECRET_TOKEN" not in reader_env and reader_env["PASTORE_RUN_DIR"].endswith("/out")
-    assert reader_env["FUCONE_RUN_DIR"] == reader_env["PASTORE_RUN_DIR"]
+    assert reader_env.keys() == {*check_env, "PASTORE_RUN_DIR"}
 
 
 def test_a_manifest_edit_reruns_a_done_one_shot(tmp_path: Path) -> None:
@@ -1441,12 +1444,27 @@ def test_a_run_whose_host_left_the_policy_ends_as_a_normal_charged_failure(tmp_p
     assert job is not None and job.attempts == 1 and rig.events("failed") == []
 
 
-def test_the_global_gate_asks_the_policy_workstations_ollama(tmp_path: Path) -> None:
+def test_the_global_gate_asks_the_endpoint_jobs_use(tmp_path: Path) -> None:
     urls: list[str] = []
     rig = Rig(tmp_path, [task(tmp_path, "a")], ["c/a"], host=host(seen=urls))
     rig.tick()
-    assert urls == [WS_URL + "/api/tags"]
-    assert rig.deps.ollama_url not in "".join(urls)
+    assert urls == [rig.deps.ollama_url + "/api/tags"]
+    assert WS_URL not in "".join(urls)
+
+
+def test_a_refusing_job_endpoint_starts_nothing_while_the_workstation_ollama_answers(
+    tmp_path: Path,
+) -> None:
+    refused: set[str] = set()
+    rig = Rig(tmp_path, [task(tmp_path, "a")], ["c/a"], host=host(refused=refused))
+    refused.add(rig.deps.ollama_url)
+    rig.tick()
+    job = rig.state.get_job("c/a", MODEL)
+    assert rig.handles == [] and rig.state.idle_reason() == "ollama-down"
+    assert job is not None and (job.status, job.attempts) == ("pending", 0)
+    refused.clear()
+    rig.tick()
+    assert len(rig.handles) == 1
 
 
 def test_recover_crashes_every_running_row_and_charges_each_on_its_second_crash(

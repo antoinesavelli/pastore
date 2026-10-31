@@ -21,7 +21,7 @@ IDLE_REASONS = (
 TASK_EVENTS = ("refused", "reader-failed", "awaiting-review", "starved", "done", "failed")
 WORKSTATION = "workstation"
 BASE_ENV_KEYS = ("PATH", "HOME", "LANG", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
-RUN_DIR_ENV = ("PASTORE_RUN_DIR", "FUCONE_RUN_DIR")
+RUN_DIR_ENV = "PASTORE_RUN_DIR"
 SOURCE_KINDS = ("cgroup", "peer", "ancestor", "under")
 EXCLUDABLE_KINDS = ("cgroup", "peer")
 

@@ -23,7 +23,7 @@ UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600}
 TASK_KEYS = frozenset(
     "id kind argv cwd env model models timeout ok_exit resumable ollama_env model_env reader ready".split()
 )
-RESERVED_ENV = frozenset(RUN_DIR_ENV)
+RESERVED_ENV = frozenset({RUN_DIR_ENV})
 PASTORE_SETS = frozenset(BASE_ENV_KEYS) | RESERVED_ENV
 Which = Callable[[str], str | None]
 _NO_ARGV: tuple[str, ...] = ()
