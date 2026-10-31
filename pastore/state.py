@@ -355,7 +355,7 @@ class State:
         return row is not None
 
     def set_workload_watch(self, text: str) -> None:
-        """Store the R35 watch status (armed, down, no-signal, unreadable: ...)."""
+        """Store the R35 watch status (armed, down, no-signal, unreadable: ..., off)."""
         with self._conn:
             self._set_meta("workload_watch", text)
 

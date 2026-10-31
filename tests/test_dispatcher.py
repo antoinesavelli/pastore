@@ -186,6 +186,7 @@ class Rig:
         *,
         hosts: Mapping[str, HostSpec] = WORKSTATION_ONLY,
         net: FakeNet | None = None,
+        watch: str = "",
         **deps: object,
     ) -> None:
         self.root = tmp_path / "repo"
@@ -195,6 +196,7 @@ class Rig:
         self.specs = {s.id: s for s in specs}
         self.policy = tmp_path / "policy.yaml"
         self.hosts = dict(hosts)
+        self.watch = watch
         self.net = net or FakeNet()
         self.list_jobs(jobs)
         everything = {MODEL, *(m for s in specs for m in s.models), *(p[1] for p in self.pairs)}
@@ -225,7 +227,7 @@ class Rig:
             self.state.record_contract_pass(s.ref, s.fingerprint, T0)
 
     def list_jobs(self, jobs: Jobs) -> None:
-        """Write a valid v2 policy listing these jobs; a bare task ref uses the default model."""
+        """Write a valid v2 policy listing these jobs (and the `watch:` section text, if any); a bare task ref uses the default model."""
         evidence = json.dumps(str(self.root / "evidence.json"))
         self.pairs = [(j, MODEL) if isinstance(j, str) else j for j in jobs]
         listed = "".join(
@@ -241,7 +243,7 @@ class Rig:
             "version: 2\n"
             f"hosts:\n{hosts}"
             'sources:\n  - {level: hearth, cgroup: ["pastore-*.scope"]}\n'
-            f"consumers:\n  c: {self.root / 'gpu-tasks.yaml'}\njobs:\n{listed or '  []'}\n"
+            f"consumers:\n  c: {self.root / 'gpu-tasks.yaml'}\njobs:\n{listed or '  []'}\n{self.watch}"
         )
 
     def run_in(
@@ -883,11 +885,12 @@ def fleet_rig(
     ids: Sequence[str] = ("a",),
     hosts: Mapping[str, HostSpec] = FLEET,
     task_kw: Mapping[str, object] | None = None,
+    watch: str = "",
     **deps: object,
 ) -> Rig:
-    """A Rig over the two-host fleet: one task per id, all offering `models`."""
+    """A Rig over the two-host fleet: one task per id, all offering `models`; `watch` is the policy's `watch:` section text."""
     specs = [task(tmp_path, i, models=models, **(task_kw or {})) for i in ids]
-    return Rig(tmp_path, specs, jobs, hosts=hosts, net=net, **deps)
+    return Rig(tmp_path, specs, jobs, hosts=hosts, net=net, watch=watch, **deps)
 
 
 def test_check_8_a_model_needing_over_10_gib_goes_to_the_workstation_never_the_executor(

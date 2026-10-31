@@ -1,6 +1,6 @@
-"""R35 workload-disruption watch: workload journal lines against executor run spans; records and alerts only.
+"""R35 foreign-workload watch: a workload on a second host, read from its journal, against executor run spans; records and alerts only.
 
-Depends on: pastore.runner (Runner) and stdlib; the journal is read on the workstation through an injected runner.
+Depends on: pastore.runner (Runner), pastore.spec (WatchConfig, Signal) and stdlib; the journal is read on the workstation through an injected runner.
 """
 
 import json
@@ -11,19 +11,15 @@ from datetime import UTC, datetime, timedelta
 from typing import NamedTuple
 
 from pastore.runner import Runner
+from pastore.spec import Signal, ValueSignal, WatchConfig
 
-REACHABILITY_UNIT = "workload-health.service"
-WORKLOAD_UNIT = "workload.service"
-UNITS = (REACHABILITY_UNIT, WORKLOAD_UNIT)
 AFTER_RUN = timedelta(minutes=10)
 KEEP_AFTER_END = timedelta(minutes=30)
 LOOKBACK = timedelta(minutes=15)
 STATUS_WINDOW = timedelta(minutes=30)
-LAG_LIMIT_S = 900
+MAX_DIGITS = 9
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
-_UP = re.compile(r"health=(ok|down)\b")
-_LAG = re.compile(r"data lag: (\d+)s")
 
 
 class JournalError(Exception):
@@ -51,7 +47,7 @@ class Span:
 
 @dataclass(frozen=True)
 class Disruption:
-    """A foreign workload disruption; `end` is None while it lasts."""
+    """A disruption of the watched workload; `end` is None while it lasts."""
 
     signal: str
     start: datetime
@@ -144,41 +140,41 @@ class _Sample(NamedTuple):
     good: bool
 
 
-def _engine_samples(line: Line) -> list[_Sample]:
-    found = []
-    if "link_lost" in line.message or "[LINK ALARM]" in line.message:
-        found.append(_Sample(line.at, "link", False))
-    elif "link restored" in line.message:
-        found.append(_Sample(line.at, "link", True))
-    lag = _LAG.search(line.message)
-    if lag:
-        digits = lag.group(1).lstrip("0") or "0"
-        found.append(_Sample(line.at, "lag", len(digits) <= 9 and int(digits) <= LAG_LIMIT_S))
-    return found
+def _judge(signal: Signal, message: str) -> bool | None:
+    """Whether the message is a good sample of the signal, a bad one, or none; a number that is not digits is none."""
+    if isinstance(signal, ValueSignal):
+        hit = re.search(signal.value, message)
+        digits = hit.group(1) if hit else None
+        if not digits or not digits.isdecimal():
+            return None
+        digits = digits.lstrip("0") or "0"
+        return len(digits) <= MAX_DIGITS and int(digits) <= signal.limit
+    if re.search(signal.bad, message):
+        return False
+    return True if re.search(signal.good, message) else None
 
 
-def _samples(lines: Sequence[Line]) -> list[_Sample]:
+def _samples(config: WatchConfig, lines: Sequence[Line]) -> list[_Sample]:
     found: list[_Sample] = []
     for line in lines:
-        if line.unit == REACHABILITY_UNIT:
-            up = _UP.match(line.message)
-            if up:
-                found.append(_Sample(line.at, "reachability", up.group(1) == "ok"))
-        elif line.unit == WORKLOAD_UNIT:
-            found += _engine_samples(line)
+        for signal in config.signals:
+            good = _judge(signal, line.message) if signal.unit == line.unit else None
+            if good is not None:
+                found.append(_Sample(line.at, signal.name, good))
     return sorted(found, key=lambda s: s.at)
 
 
-def disruptions(lines: Sequence[Line]) -> list[Disruption]:
-    """Good-to-bad transitions per signal; a first bad link sample counts, a first bad reachability or lag does not."""
+def disruptions(config: WatchConfig, lines: Sequence[Line]) -> list[Disruption]:
+    """Good-to-bad transitions per signal; a first bad sample counts only for a signal marked `first_bad`."""
+    first_bad = {signal.name for signal in config.signals if signal.first_bad}
     previous: dict[str, bool] = {}
     open_at: dict[str, datetime] = {}
     found: list[Disruption] = []
-    for at, signal, good in _samples(lines):
+    for at, signal, good in _samples(config, lines):
         before = previous.get(signal)
         if good and signal in open_at:
             found.append(Disruption(signal, open_at.pop(signal), at))
-        elif not good and (before is True or (before is None and signal == "link")):
+        elif not good and (before is True or (before is None and signal in first_bad)):
             open_at[signal] = at
         previous[signal] = good
     found += [Disruption(signal, at, None) for signal, at in open_at.items()]
@@ -201,15 +197,17 @@ def read_since(now: datetime, spans: Sequence[Span]) -> datetime:
     return min([now - STATUS_WINDOW, *(s.start - LOOKBACK for s in spans)])
 
 
-def watch(now: datetime, spans: Sequence[Span], read: JournalReader) -> Watch:
-    """Read both workload units and report the status and any overlap with the spans; it never acts."""
+def watch(config: WatchConfig, now: datetime, spans: Sequence[Span], read: JournalReader) -> Watch:
+    """Read the watched units and report the status and any overlap with the spans; it never acts."""
     since = read_since(now, spans)
     try:
-        lines = [line for unit in UNITS for line in read(unit, since)]
+        lines = [line for unit in config.units for line in read(unit, since)]
     except JournalError as exc:
         return Watch(f"unreadable: {exc}", ())
     recent = [
-        s for s in _samples(lines) if s.signal == "reachability" and s.at >= now - STATUS_WINDOW
+        s
+        for s in _samples(config, lines)
+        if s.signal == config.status and s.at >= now - STATUS_WINDOW
     ]
     status = "no-signal" if not recent else "armed" if recent[-1].good else "down"
-    return Watch(status, tuple(overlaps(spans, disruptions(lines))))
+    return Watch(status, tuple(overlaps(spans, disruptions(config, lines))))

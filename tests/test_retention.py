@@ -18,6 +18,7 @@ import pastore.dispatcher as dispatcher_module
 import pastore.runner as runner_module
 from pastore.dispatcher import PRUNE_EVERY, _guarded_tick
 from pastore.runner import RUN_DIR_MAX_AGE, new_run_id, prune_run_dirs
+from pastore.spec import WatchConfig
 from pastore.state import RunRow, default_paths, open_state
 from pastore.tick_bound import TickOverrun
 from tests.test_dispatcher import MODEL, Rig, task
@@ -391,9 +392,9 @@ def test_the_prune_runs_after_the_workload_watch_outside_any_critical_section(
     depths: list[int] = []
     real_watch = rig.d._watch_workload
 
-    def watch(now: datetime) -> None:
+    def watch(now: datetime, config: WatchConfig | None) -> None:
         order.append("watch")
-        real_watch(now)
+        real_watch(now, config)
 
     def spy(runs_dir: Path, keep: set[str], now: datetime) -> list[str]:
         order.append("prune")

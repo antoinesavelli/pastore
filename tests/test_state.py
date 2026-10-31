@@ -57,6 +57,42 @@ def test_open_creates_wal_schema_and_reopens(paths: StatePaths) -> None:
     open_state(paths).close()
 
 
+RETIRED = "legacy"
+
+
+def test_a_state_with_the_retired_watch_rows_opens_and_keeps_them(paths: StatePaths) -> None:
+    open_state(paths).close()
+    conn = sqlite3.connect(paths.db)
+    with conn:
+        conn.execute(
+            "INSERT INTO events(at, ref, kind, detail) VALUES(?, 'c/a', ?, 'r1 link t1 more')",
+            (T0.isoformat(), f"{RETIRED}-overlap"),
+        )
+        conn.execute("INSERT INTO meta(key, value) VALUES(?, 'armed')", (f"{RETIRED}_watch",))
+        conn.execute("INSERT INTO meta(key, value) VALUES(?, '1')", (f"{RETIRED}_acked_id",))
+    conn.close()
+    for readonly in (True, False):
+        state = open_state(paths, readonly=readonly)
+        assert state.workload_watch() is None and state.unacked_workload_overlaps() == []
+        assert [e.kind for e in state.recent_events(10)] == [f"{RETIRED}-overlap"]
+        state.close()
+    state = open_state(paths)
+    assert state.ack_workload(T0) == 0
+    state.set_workload_watch("off")
+    state.record_event(T0, "workload-overlap", "c/a", "r2 link t2 more")
+    assert state.workload_watch() == "off"
+    assert [e.detail for e in state.unacked_workload_overlaps()] == ["r2 link t2 more"]
+    assert state.has_event(f"{RETIRED}-overlap", "r1 link t1")
+    with pytest.raises(ValueError, match="unknown event kind"):
+        state.record_event(T0, f"{RETIRED}-overlap", "c/a", "r3 link t3")
+    state.close()
+    conn = sqlite3.connect(paths.db)
+    assert conn.execute("SELECT value FROM meta WHERE key=?", (f"{RETIRED}_watch",)).fetchone() == (
+        "armed",
+    )
+    conn.close()
+
+
 def test_schema_2_has_model_and_host_columns_and_a_ref_model_key(paths: StatePaths) -> None:
     open_state(paths).close()
     conn = sqlite3.connect(paths.db)

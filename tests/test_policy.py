@@ -1,6 +1,6 @@
-"""Pins policy.yaml v2 parsing, canonical rendering, last-good caching and the add/remove edits.
+"""Pins policy.yaml v2 parsing (with the optional watch section), canonical rendering, last-good caching and the add/remove edits.
 
-Depends on: pastore.policy, pastore.spec and pytest only.
+Depends on: pastore.policy, pastore.spec and pytest only; reads the tracked policy.example.yaml, never a live policy.yaml.
 """
 
 import copy
@@ -24,9 +24,9 @@ from pastore.policy import (
     with_job_added,
     with_job_removed,
 )
-from pastore.spec import Host, Level, Pair, SourceRule
+from pastore.spec import Host, Level, Pair, PatternSignal, SourceRule, ValueSignal, WatchConfig
 
-REPO_POLICY = Path(__file__).resolve().parent.parent / "policy.yaml"
+EXAMPLE_POLICY = Path(__file__).resolve().parent.parent / "policy.example.yaml"
 BENCH_SHA = hashlib.sha256(b"bench").hexdigest()
 GOOD_DATA: dict[str, Any] = {
     "version": 2,
@@ -64,6 +64,29 @@ GOOD_DATA: dict[str, Any] = {
         }
     ],
 }
+WATCH_DATA: dict[str, Any] = {
+    "status": "health",
+    "signals": [
+        {"name": "health", "unit": "workload-health.service", "good": r"^ok\b", "bad": r"^down\b"},
+        {
+            "name": "link",
+            "unit": "workload.service",
+            "good": "link restored",
+            "bad": "link lost",
+            "first_bad": True,
+        },
+        {"name": "lag", "unit": "workload.service", "value": r"lag (\d+)s", "limit": 900},
+    ],
+}
+WATCHED_DATA: dict[str, Any] = {**GOOD_DATA, "watch": WATCH_DATA}
+WATCH = WatchConfig(
+    "health",
+    (
+        PatternSignal("health", "workload-health.service", r"^ok\b", r"^down\b"),
+        PatternSignal("link", "workload.service", "link restored", "link lost", first_bad=True),
+        ValueSignal("lag", "workload.service", r"lag (\d+)s", 900),
+    ),
+)
 GOOD = yaml.safe_dump(GOOD_DATA, sort_keys=False)
 DELETE = object()
 V1_TEXT = """version: 1
@@ -75,9 +98,9 @@ jobs:
 """
 
 
-def mutated(path: tuple[str | int, ...], value: object) -> str:
-    """GOOD with the value at `path` replaced (or deleted), as YAML text."""
-    data = copy.deepcopy(GOOD_DATA)
+def mutated(path: tuple[str | int, ...], value: object, base: dict[str, Any] = GOOD_DATA) -> str:
+    """`base` (GOOD_DATA unless given) with the value at `path` replaced (or deleted), as YAML text."""
+    data = copy.deepcopy(base)
     target: Any = data
     for step in path[:-1]:
         target = target[step]
@@ -148,11 +171,11 @@ def test_two_models_of_one_task_are_two_pairs() -> None:
     ]
 
 
-def test_repo_policy_loads_and_round_trips_byte_for_byte() -> None:
-    policy = load_policy(REPO_POLICY)
+def test_example_policy_loads_and_round_trips() -> None:
+    policy = load_policy(EXAMPLE_POLICY)
     assert policy.hosts == {
-        "workstation": Host("workstation", "http://127.0.0.1:11435", 21.5, 1, 1, 32768),
-        "executor": Host("executor", "http://127.0.0.1:11436", 5.6, 3, 3, 8192),
+        "workstation": Host("workstation", "http://127.0.0.1:11435", 20.0, 1, 1, 32768),
+        "second": Host("second", "http://127.0.0.1:11436", 10.0, 1, 1, 8192),
     }
     assert policy.sources == (
         SourceRule(Level.HEARTH, "cgroup", ("pastore-*.scope",)),
@@ -162,11 +185,15 @@ def test_repo_policy_loads_and_round_trips_byte_for_byte() -> None:
         SourceRule(Level.CORSU, "under", ("/srv/projects",)),
         SourceRule(Level.ROUTINE, "cgroup", ("*.service", "*.scope"), ("session-*.scope",)),
     )
-    assert set(policy.consumers) == {"memory", "torra"}
+    assert set(policy.consumers) == {"example"}
     assert all(pair.task.split("/", 1)[0] in policy.consumers for pair in policy.jobs)
     assert len({(pair.task, pair.model) for pair in policy.jobs}) == len(policy.jobs)
     assert all(re.fullmatch("[0-9a-f]{64}", pair.sha256) for pair in policy.jobs)
-    assert render_policy(policy) == REPO_POLICY.read_text()
+    assert policy.watch == WATCH
+    rendered = render_policy(policy)
+    assert parse_policy(rendered) == policy
+    example = re.sub(r" +#.*", "", EXAMPLE_POLICY.read_text().split("\nwatch:\n", 1)[1])
+    assert rendered.split("\nwatch:\n", 1)[1] == example
 
 
 def rich_policy() -> Policy:
@@ -199,11 +226,27 @@ def rich_policy() -> Policy:
     return Policy(hosts, sources, consumers, jobs)
 
 
-@pytest.mark.parametrize("variant", ["rich", "no-consumers-no-jobs"])
+def awkward_watch() -> WatchConfig:
+    """Signals whose regexes need every kind of quoting: backslashes, quotes, brackets, non-ASCII, newlines."""
+    return WatchConfig(
+        "yes",
+        (
+            PatternSignal("yes", "a@b.service", r"^ok\b \[x\] \d+ '\w'", 'q"\\b'),
+            PatternSignal("no", "d.service", "caf\u00e9\U0001f600", "a\nb\tc", first_bad=True),
+            ValueSignal("on", "e-f_g.1:h.timer", r"n=(\d+)\s*\\", 7, first_bad=True),
+        ),
+    )
+
+
+@pytest.mark.parametrize("variant", ["rich", "no-consumers-no-jobs", "watch", "awkward-watch"])
 def test_render_round_trips(variant: str) -> None:
     policy = rich_policy()
-    if variant != "rich":
+    if variant == "no-consumers-no-jobs":
         policy = Policy(policy.hosts, policy.sources, {}, ())
+    elif variant == "watch":
+        policy = replace(policy, watch=WATCH)
+    elif variant == "awkward-watch":
+        policy = replace(policy, watch=awkward_watch())
     text = render_policy(policy)
     assert parse_policy(text) == policy
     assert render_policy(parse_policy(text)) == text
@@ -643,3 +686,143 @@ def test_policy_diff_shows_the_added_pair() -> None:
         line for line in diff.splitlines() if line.startswith("+") and not line.startswith("+++")
     ]
     assert len(added_lines) == 1 and "vault/index" in added_lines[0] and "--- " in diff
+
+
+# --- the optional watch section ---------------------------------------------------------------
+
+
+def test_a_policy_without_a_watch_section_has_none_and_renders_none() -> None:
+    policy = parse_policy(GOOD)
+    assert policy.watch is None and "watch" not in render_policy(policy)
+
+
+def test_the_watch_section_parses_into_typed_signals() -> None:
+    policy = parse_policy(yaml.safe_dump(WATCHED_DATA, sort_keys=False))
+    assert policy.watch == WATCH
+    assert policy.watch.units == ("workload-health.service", "workload.service")
+    assert [type(s) for s in policy.watch.signals] == [PatternSignal, PatternSignal, ValueSignal]
+    assert [s.first_bad for s in policy.watch.signals] == [False, True, False]
+
+
+def test_the_watch_section_renders_regexes_in_single_quotes_with_backslashes_intact() -> None:
+    text = render_policy(replace(parse_policy(GOOD), watch=WATCH))
+    assert (
+        "    - {name: health, unit: \"workload-health.service\", good: '^ok\\b', bad: '^down\\b'}"
+        in text
+    )
+    assert "value: 'lag (\\d+)s', limit: 900}" in text
+    assert "good: 'link restored', bad: 'link lost', first_bad: true}" in text
+    text = render_policy(replace(parse_policy(GOOD), watch=awkward_watch()))
+    assert r"""good: '^ok\b \[x\] \d+ ''\w''', bad: 'q"\b'}""" in text
+    assert text.isascii() and r"""good: "caf\xE9\U0001F600",""" in text
+    assert r'bad: "a\nb\tc", first_bad: true}' in text
+    assert r"value: 'n=(\d+)\s*\\', limit: 7, first_bad: true" in text
+
+
+def test_add_and_remove_keep_the_watch() -> None:
+    policy = replace(parse_policy(GOOD), watch=WATCH)
+    added = with_job_added(policy, VAULT)
+    assert added.watch == WATCH and parse_policy(render_policy(added)) == added
+    assert with_job_removed(added, VAULT.task, VAULT.model).watch == WATCH
+    diff = policy_diff(render_policy(policy), render_policy(added), Path("policy.yaml"))
+    changed = [x for x in diff.splitlines() if x[:1] in "+-" and not x.startswith(("+++", "---"))]
+    assert len(changed) == 1 and "vault/index" in changed[0]
+
+
+def signals(index: int, key: str) -> tuple[str | int, ...]:
+    """The path to a key of the index-th watch signal."""
+    return ("watch", "signals", index, key)
+
+
+TOO_MANY = [{**WATCH_DATA["signals"][0], "name": f"s{i}"} for i in range(9)]
+BAD_WATCH_EDITS: list[tuple[tuple[str | int, ...], object, str]] = [
+    (("watch",), None, "watch must be a mapping with signals, status"),
+    (("watch",), ["health"], "watch must be a mapping with signals, status"),
+    (("watch", "extra"), 1, "watch: unknown key 'extra'"),
+    (("watch", "status"), DELETE, "watch: missing key 'status'"),
+    (("watch", "signals"), DELETE, "watch: missing key 'signals'"),
+    (("watch", "status"), "nope", "watch: status 'nope' must name a signal with good and bad"),
+    (("watch", "status"), "lag", "watch: status 'lag' must name a signal with good and bad"),
+    (("watch", "status"), 5, "watch: status 5 must name a signal with good and bad"),
+    (("watch", "status"), ["health"], "watch: status ['health'] must name a signal"),
+    (("watch", "signals"), [], "watch.signals must be a list of 1 to 8 signals"),
+    (("watch", "signals"), "health", "watch.signals must be a list of 1 to 8 signals"),
+    (("watch", "signals"), TOO_MANY, "watch.signals must be a list of 1 to 8 signals"),
+    (("watch", "signals", 1), "link", "watch.signals[1] must be a mapping"),
+    (signals(0, "colour"), 1, "watch.signals[0]: unknown key 'colour'"),
+    (signals(0, "name"), DELETE, "watch.signals[0]: missing key 'name'"),
+    (signals(0, "unit"), DELETE, "watch.signals[0]: missing key 'unit'"),
+    (signals(0, "good"), DELETE, "watch.signals[0]: missing key 'good'"),
+    (signals(0, "bad"), DELETE, "watch.signals[0]: missing key 'bad'"),
+    (signals(2, "limit"), DELETE, "watch.signals[2]: missing key 'limit'"),
+    (signals(2, "value"), DELETE, "watch.signals[2]: missing key 'value'"),
+    (signals(2, "good"), "x", "watch.signals[2]: unknown key 'good'"),
+    (signals(0, "value"), r"(\d+)", "watch.signals[0]: unknown key 'good'"),
+    *[
+        (signals(0, "name"), name, "watch.signals[0]: name must be a name matching")
+        for name in ("Health", "1x", "", "a b", "a_b", "-a", "a" * 33, 7)
+    ],
+    (signals(1, "name"), "health", "watch.signals: name 'health' is used twice"),
+    *[
+        (signals(0, "unit"), unit, "watch.signals[0]: unit must be a systemd unit name")
+        for unit in ("-x.service", "a b.service", "a/b.service", "", "a\nb", "x\x00", "a*", 7)
+    ],
+    *[
+        (signals(0, key), regex, f"watch.signals[0]: {key} must be a non-empty regex string")
+        for key in ("good", "bad")
+        for regex in ("", 5, None, ["a"])
+    ],
+    *[
+        (signals(0, "bad"), regex, "watch.signals[0]: bad is not a valid regex")
+        for regex in ("[", "(", "a{2,1}", "a{99999999999}", "(" * 1000 + ")" * 1000, "*a")
+    ],
+    (signals(2, "value"), r"lag \d+s", "value must have exactly 1 capture group, got 0"),
+    (signals(2, "value"), r"(lag) (\d+)s", "value must have exactly 1 capture group, got 2"),
+    (signals(2, "value"), r"((\d+))", "value must have exactly 1 capture group, got 2"),
+    (signals(2, "value"), "(", "watch.signals[2]: value is not a valid regex"),
+    *[
+        (signals(2, "limit"), limit, "watch.signals[2]: limit must be a positive int")
+        for limit in (0, -1, "900", True, 1.5, None)
+    ],
+    *[
+        (signals(1, "first_bad"), flag, "watch.signals[1]: first_bad must be true or false")
+        for flag in ("yes", 1, "true", None)
+    ],
+]
+
+
+@pytest.mark.parametrize(("path", "value", "fragment"), BAD_WATCH_EDITS)
+def test_an_invalid_watch_section_is_refused(
+    path: tuple[str | int, ...], value: object, fragment: str
+) -> None:
+    with pytest.raises(PolicyError) as info:
+        parse_policy(mutated(path, value, WATCHED_DATA))
+    assert fragment in str(info.value)
+
+
+def test_a_bad_watch_section_is_reported_with_every_other_problem() -> None:
+    data = copy.deepcopy(WATCHED_DATA)
+    data["version"] = 1
+    data["watch"]["signals"][0]["good"] = "["
+    data["watch"]["signals"][2]["limit"] = 0
+    with pytest.raises(PolicyError) as info:
+        parse_policy(yaml.safe_dump(data, sort_keys=False))
+    message = str(info.value)
+    for fragment in ("version must be 2", "signals[0]: good is not a valid regex", "limit"):
+        assert fragment in message
+    assert "status" not in message
+
+
+def test_an_unknown_top_level_key_is_still_refused_next_to_a_watch_section() -> None:
+    data = {**WATCHED_DATA, "wach": copy.deepcopy(WATCH_DATA)}
+    with pytest.raises(PolicyError, match="unknown key 'wach'"):
+        parse_policy(yaml.safe_dump(data, sort_keys=False))
+
+
+def test_eight_signals_are_the_most_a_watch_takes() -> None:
+    eight = TOO_MANY[:8]
+    text = mutated(("watch", "signals"), eight, WATCHED_DATA).replace(
+        "status: health", "status: s0"
+    )
+    policy = parse_policy(text)
+    assert policy.watch is not None and len(policy.watch.signals) == 8

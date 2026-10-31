@@ -20,3 +20,10 @@ consumers:
   example: "/srv/projects/example/gpu-tasks.yaml"
 jobs:
   - {task: "example/index", model: "nomic-embed-text", evidence: "/srv/projects/example/evidence.json", sha256: "0000000000000000000000000000000000000000000000000000000000000000"}
+# Optional: watch a foreign workload on a second host. Its journal lines are read each tick and compared with the runs on the executor; an overlap is recorded and alerted, never acted on. Leave the section out to switch the watch off.
+watch:
+  status: health                  # the signal whose latest sample in the status window sets armed / down
+  signals:                        # 1..8 signals, unique names; units are read in first-seen order
+    - {name: health, unit: "workload-health.service", good: '^ok\b', bad: '^down\b'}
+    - {name: link, unit: "workload.service", good: 'link restored', bad: 'link lost', first_bad: true}
+    - {name: lag, unit: "workload.service", value: 'lag (\d+)s', limit: 900}

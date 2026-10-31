@@ -1,6 +1,6 @@
-"""Parse and validate policy.yaml v2 (hosts, sources, consumers, listed pairs), keep the last good copy, render and edit.
+"""Parse and validate policy.yaml v2 (hosts, sources, consumers, listed pairs, the optional watch), keep the last good copy, render and edit.
 
-Depends on: spec (Host, Level, Pair, SourceRule, WORKSTATION and the source-kind lists), PyYAML and stdlib only.
+Depends on: spec (Host, Level, Pair, SourceRule, the signal and WatchConfig types, WORKSTATION and the source-kind lists), PyYAML and stdlib only.
 """
 
 import difflib
@@ -16,11 +16,28 @@ import yaml
 from yaml.composer import ComposerError
 from yaml.constructor import ConstructorError
 
-from pastore.spec import EXCLUDABLE_KINDS, SOURCE_KINDS, WORKSTATION, Host, Level, Pair, SourceRule
+from pastore.spec import (
+    EXCLUDABLE_KINDS,
+    SOURCE_KINDS,
+    WORKSTATION,
+    Host,
+    Level,
+    Pair,
+    PatternSignal,
+    Signal,
+    SourceRule,
+    ValueSignal,
+    WatchConfig,
+)
 
 VERSION = 2
 KEYS = frozenset({"version", "hosts", "sources", "consumers", "jobs"})
+OPTIONAL_KEYS = frozenset({"watch"})
 RULE_KEYS = frozenset({"level", "exclude", *SOURCE_KINDS})
+WATCH_KEYS = frozenset({"status", "signals"})
+MAX_SIGNALS = 8
+SIGNAL_NAME = re.compile(r"[a-z][a-z0-9-]{0,31}")
+UNIT_NAME = re.compile(r"[A-Za-z0-9:_.\\@][A-Za-z0-9:_.\\@-]*")
 MANIFEST_NAME = "gpu-tasks.yaml"
 NAME = re.compile(r"[a-z0-9][a-z0-9_-]*")
 URL = re.compile(r"http://(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):0*([0-9]{1,5})/?")
@@ -34,7 +51,7 @@ HEADER = (
     " (first = highest priority).\n"
     "# Adding a pair is ask-first: `pastore add <consumer>/<id> --model <name> --evidence <path>`"
     " with a passing\n"
-    "# `pastore check --contract <consumer>/<id>` (docs/DESIGN-v5.md R29).\n"
+    "# `pastore check --contract <consumer>/<id>` (docs/DESIGN.md R29).\n"
     "# Each host's context is its Ollama's default context length in tokens;"
     " placement counts KV cache per slot at it (D-041).\n"
     "# Each host's vram_gib is the usable VRAM its Ollama reports, in GiB (D-050).\n"
@@ -47,12 +64,13 @@ class PolicyError(Exception):
 
 @dataclass(frozen=True)
 class Policy:
-    """A validated policy: hosts, source-level rules, consumer manifests, ordered task+model pairs."""
+    """A validated policy: hosts, source-level rules, consumer manifests, ordered task+model pairs, the optional watch."""
 
     hosts: Mapping[str, Host]
     sources: tuple[SourceRule, ...]
     consumers: Mapping[str, Path]
     jobs: tuple[Pair, ...]
+    watch: WatchConfig | None = None
 
 
 def _fields(
@@ -328,6 +346,79 @@ def _parse_jobs(
     return tuple(pairs)
 
 
+def _regex(groups: int | None = None) -> Callable[[object], str]:
+    """A validator for a non-empty string that compiles as a regex, with exactly `groups` capture groups when given."""
+
+    def check(value: object) -> str:
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"must be a non-empty regex string, got {value!r}")
+        try:
+            compiled = re.compile(value)
+        except (re.error, OverflowError, RecursionError) as exc:
+            raise ValueError(f"is not a valid regex ({exc}): {value!r}") from None
+        if groups is not None and compiled.groups != groups:
+            raise ValueError(f"must have exactly {groups} capture group, got {compiled.groups}")
+        return value
+
+    return check
+
+
+def _parse_signal(where: str, raw: object, problems: list[str]) -> Signal | None:
+    if not isinstance(raw, dict):
+        problems.append(f"{where} must be a mapping with name, unit, good + bad or value + limit")
+        return None
+    before = len(problems)
+    first_bad = raw.get("first_bad", False)
+    if type(first_bad) is not bool:
+        problems.append(f"{where}: first_bad must be true or false, got {first_bad!r}")
+    body = {k: v for k, v in raw.items() if k != "first_bad"}
+    common = {
+        "name": _matching(SIGNAL_NAME, f"a name matching {SIGNAL_NAME.pattern}"),
+        "unit": _matching(UNIT_NAME, "a systemd unit name (not starting with '-')"),
+    }
+    kind = ValueSignal if "value" in body or "limit" in body else PatternSignal
+    if kind is ValueSignal:
+        shape = {**common, "value": _regex(1), "limit": _positive}
+    else:
+        shape = {**common, "good": _regex(), "bad": _regex()}
+    fields = _fields(where, body, shape, problems)
+    return None if fields is None or len(problems) > before else kind(**fields, first_bad=first_bad)
+
+
+def _parse_signals(raw: object, problems: list[str]) -> tuple[Signal, ...]:
+    if not isinstance(raw, list) or not 1 <= len(raw) <= MAX_SIGNALS:
+        problems.append(f"watch.signals must be a list of 1 to {MAX_SIGNALS} signals")
+        return ()
+    parsed = [_parse_signal(f"watch.signals[{i}]", item, problems) for i, item in enumerate(raw)]
+    signals = tuple(signal for signal in parsed if signal is not None)
+    names = [signal.name for signal in signals]
+    problems += [
+        f"watch.signals: name {n!r} is used twice"
+        for n in dict.fromkeys(names)
+        if names.count(n) > 1
+    ]
+    return signals
+
+
+def _parse_watch(raw: object, problems: list[str]) -> WatchConfig | None:
+    if not isinstance(raw, dict):
+        problems.append(f"watch must be a mapping with {', '.join(sorted(WATCH_KEYS))}")
+        return None
+    before = len(problems)
+    problems += [f"watch: unknown key {k!r}" for k in raw if k not in WATCH_KEYS]
+    problems += [f"watch: missing key {k!r}" for k in sorted(WATCH_KEYS - raw.keys())]
+    signals = _parse_signals(raw["signals"], problems) if "signals" in raw else ()
+    status = raw.get("status")
+    if len(problems) > before:
+        return None
+    if not isinstance(status, str) or not any(
+        isinstance(s, PatternSignal) and s.name == status for s in signals
+    ):
+        problems.append(f"watch: status {status!r} must name a signal with good and bad patterns")
+        return None
+    return WatchConfig(status, signals)
+
+
 class _UniqueKeyLoader(yaml.SafeLoader):
     """SafeLoader that refuses aliases (a few hundred bytes of nested ones expand to gigabytes), merge keys and a mapping key written twice (PyYAML keeps the last)."""
 
@@ -367,7 +458,7 @@ def _parse(text: str) -> Policy:
     data = yaml.load(text, Loader=_UniqueKeyLoader)
     if not isinstance(data, dict):
         raise PolicyError("policy must be a mapping with version, hosts, sources, consumers, jobs")
-    problems = [f"unknown key {k!r}" for k in data if k not in KEYS]
+    problems = [f"unknown key {k!r}" for k in data if k not in KEYS | OPTIONAL_KEYS]
     problems += [f"missing key {k!r}" for k in sorted(KEYS - set(data))]
     if type(data.get("version")) is not int or data["version"] != VERSION:
         problems.append(f"version must be {VERSION}, got {data.get('version')!r}")
@@ -375,9 +466,10 @@ def _parse(text: str) -> Policy:
     sources = _parse_sources(data.get("sources"), problems)
     consumers = _parse_consumers(data.get("consumers"), problems)
     jobs = _parse_jobs(data.get("jobs"), consumers, problems)
+    watch = _parse_watch(data["watch"], problems) if "watch" in data else None
     if problems:
         raise PolicyError("; ".join(problems))
-    return Policy(hosts, sources, consumers, jobs)
+    return Policy(hosts, sources, consumers, jobs, watch)
 
 
 def load_policy(path: Path) -> Policy:
@@ -466,6 +558,22 @@ def _pair_line(pair: Pair) -> str:
     return f"  - {{{fields}}}"
 
 
+def _single(value: str) -> str:
+    """A single-quoted scalar, which keeps a regex's backslashes as written; text that is not printable ASCII is double-quoted."""
+    if value.isascii() and value.isprintable():
+        return "'" + value.replace("'", "''") + "'"
+    return _quote(value)
+
+
+def _signal_line(signal: Signal) -> str:
+    if isinstance(signal, ValueSignal):
+        match = f"value: {_single(signal.value)}, limit: {signal.limit}"
+    else:
+        match = f"good: {_single(signal.good)}, bad: {_single(signal.bad)}"
+    first_bad = ", first_bad: true" if signal.first_bad else ""
+    return f"    - {{name: {_key(signal.name)}, unit: {_quote(signal.unit)}, {match}{first_bad}}}"
+
+
 def render_policy(policy: Policy) -> str:
     """Canonical policy.yaml text; load_policy of it equals the input."""
     lines = [HEADER.rstrip("\n"), f"version: {VERSION}", "hosts:"]
@@ -480,6 +588,9 @@ def render_policy(policy: Policy) -> str:
         lines += ["jobs:", *(_pair_line(p) for p in policy.jobs)]
     else:
         lines.append("jobs: []")
+    if policy.watch is not None:
+        lines += ["watch:", f"  status: {_key(policy.watch.status)}", "  signals:"]
+        lines += [_signal_line(s) for s in policy.watch.signals]
     return "\n".join(lines) + "\n"
 
 
