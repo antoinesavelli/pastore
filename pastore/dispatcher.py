@@ -22,7 +22,7 @@ from pastore.manifest import ManifestError
 from pastore.placement import HostLoad, ModelFacts, kv_bytes_per_slot, place
 from pastore.policy import Policy, PolicyCache
 from pastore.run_end import MAX_ATTEMPTS, Active, NoHandle, charge_crash, gateway_outage, oom_killed
-from pastore.runner import RunDir, fresh_run_dir, stop_leftovers
+from pastore.runner import RunDir, fresh_run_dir, prune_run_dirs, stop_leftovers
 from pastore.spec import (
     BASE_ENV_KEYS,
     RUN_DIR_ENV,
@@ -37,6 +37,7 @@ from pastore.tick_bound import TICK_BOUND_S, CriticalSections, bounded
 
 STARVED_AFTER = timedelta(hours=24)
 TICK_S = 30.0
+PRUNE_EVERY = timedelta(days=1)
 
 RunIn = Callable[[Sequence[str], Path, Mapping[str, str]], CompletedProcess[str]]
 LoadManifest = Callable[[Path, str], dict[str, TaskSpec]]
@@ -75,6 +76,7 @@ class Dispatcher(CriticalSections):
         self.draining = False
         self.terminated = False
         self._refused: set[tuple[str, str]] = set()
+        self._pruned_at: datetime | None = None
 
     def recover(self, now: datetime) -> None:
         """Stop leftover scopes, return running rows to pending, charge only a second consecutive crash."""
@@ -107,6 +109,7 @@ class Dispatcher(CriticalSections):
         else:
             self._dispatch(now, policy)
         self._watch_workload(now)
+        self._prune(now)
         return True
 
     def _watch_workload(self, now: datetime) -> None:
@@ -131,6 +134,15 @@ class Dispatcher(CriticalSections):
                     f"{overlap.key()} {overlap.detail()}",
                 )
                 print(f"<4>pastore: workload-overlap {overlap.detail()}", file=sys.stderr)
+
+    def _prune(self, now: datetime) -> None:
+        """D-050 (7): once a day, delete run folders over 30 days old except each pair's latest; stamped first, so a failure repeats daily."""
+        if self._pruned_at is not None and now - self._pruned_at < PRUNE_EVERY:
+            return
+        self._pruned_at = now
+        gone = prune_run_dirs(self.deps.paths.runs_dir, self.state.latest_run_ids(), now)
+        if gone:
+            self.state.record_event(now, "runs-pruned", detail=f"{len(gone)} {gone[0]} {gone[-1]}")
 
     def _handle_stop_request(self, now: datetime) -> bool:
         mode = "sigterm" if self.terminated else self.state.stop_requested()

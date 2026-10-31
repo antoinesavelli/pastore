@@ -1,6 +1,7 @@
 """Pins run-folder retention (D-050 (7)): old folders go except each pair's latest, run rows stay.
 
-Depends on: pastore.runner, pastore.state and pytest only; fixed datetimes, no real clock.
+Depends on: pastore.runner, pastore.state, pastore.dispatcher (the daily prune in a tick, over the dispatcher test Rig)
+and pytest only; fixed datetimes, no real clock.
 """
 
 import os
@@ -12,9 +13,13 @@ from pathlib import Path
 
 import pytest
 
+import pastore.dispatcher as dispatcher_module
 import pastore.runner as runner_module
+from pastore.dispatcher import PRUNE_EVERY, _guarded_tick
 from pastore.runner import RUN_DIR_MAX_AGE, new_run_id, prune_run_dirs
 from pastore.state import RunRow, default_paths, open_state
+from pastore.tick_bound import TickOverrun
+from tests.test_dispatcher import MODEL, Rig, task
 
 NOW = datetime(2026, 10, 31, 12, 0, 0, tzinfo=UTC)
 HOST = "workstation"
@@ -241,3 +246,154 @@ def test_pruning_leaves_every_run_row(tmp_path: Path) -> None:
     assert [p.name for p in runs.iterdir()] == [latest]
     assert len(state.runs_with_status("done")) == 3
     state.close()
+
+
+def seed(rig: Rig, ref: str, age: timedelta, seq: int = 1, row_too: bool = True) -> str:
+    """An old run folder under the rig's runs dir, with a `runs` row unless `row_too` is false (a contract folder)."""
+    started = rig.clock() - age
+    name = run_folder(rig.paths.runs_dir, started, seq)
+    if row_too:
+        rig.state.insert_run(row(name, ref, MODEL, started))
+    return name
+
+
+def idle_rig(tmp_path: Path) -> Rig:
+    return Rig(tmp_path, [task(tmp_path, "a")], [])
+
+
+@pytest.fixture
+def prune_calls(monkeypatch: pytest.MonkeyPatch) -> list[datetime]:
+    """Spy on the dispatcher's prune: the `now` of every call, the real function still runs."""
+    calls: list[datetime] = []
+    real = dispatcher_module.prune_run_dirs
+
+    def spy(runs_dir: Path, keep: set[str], now: datetime) -> list[str]:
+        calls.append(now)
+        return real(runs_dir, keep, now)
+
+    monkeypatch.setattr(dispatcher_module, "prune_run_dirs", spy)
+    return calls
+
+
+def test_the_first_tick_prunes_an_old_non_latest_folder_and_keeps_each_pairs_latest(
+    tmp_path: Path, prune_calls: list[datetime]
+) -> None:
+    rig = idle_rig(tmp_path)
+    old = seed(rig, "c/a", timedelta(days=90))
+    latest = seed(rig, "c/a", timedelta(days=45))
+    other = seed(rig, "c/b", timedelta(days=60))
+    contract = new_run_id(rig.clock() - timedelta(days=50), 1) + "-contract-503"
+    (rig.paths.runs_dir / contract).mkdir()
+    young = seed(rig, "c/c", timedelta(days=5))
+    rig.tick()
+    assert sorted(p.name for p in rig.paths.runs_dir.iterdir()) == sorted([latest, other, young])
+    assert len(prune_calls) == 1
+    (event,) = rig.events("runs-pruned")
+    assert event.detail == f"2 {old} {contract}" and event.ref is None
+    assert len(rig.state.runs_with_status("done")) == 4
+
+
+def test_a_second_tick_inside_24_hours_does_not_prune_and_one_24_hours_later_does(
+    tmp_path: Path, prune_calls: list[datetime]
+) -> None:
+    rig = idle_rig(tmp_path)
+    assert PRUNE_EVERY == timedelta(days=1)
+    rig.tick()
+    first = rig.clock()
+    stale = seed(rig, "c/a", timedelta(days=60), row_too=False)
+    rig.clock.advance(30)
+    rig.tick()
+    rig.clock.now_value = first + PRUNE_EVERY - timedelta(seconds=1)
+    rig.tick()
+    assert prune_calls == [first] and (rig.paths.runs_dir / stale).is_dir()
+    rig.clock.now_value = first + PRUNE_EVERY
+    rig.tick()
+    assert prune_calls == [first, first + PRUNE_EVERY]
+    assert not (rig.paths.runs_dir / stale).exists()
+
+
+def test_runs_pruned_is_recorded_only_when_something_was_deleted(
+    tmp_path: Path, prune_calls: list[datetime]
+) -> None:
+    rig = idle_rig(tmp_path)
+    seed(rig, "c/a", timedelta(days=5))
+    rig.tick()
+    assert len(prune_calls) == 1 and rig.events("runs-pruned") == []
+    seed(rig, "c/a", timedelta(days=60), seq=2, row_too=False)
+    rig.clock.advance(PRUNE_EVERY.total_seconds())
+    rig.tick()
+    assert len(prune_calls) == 2 and len(rig.events("runs-pruned")) == 1
+
+
+def test_a_running_jobs_folder_is_never_deleted(
+    tmp_path: Path, prune_calls: list[datetime]
+) -> None:
+    spec = task(tmp_path, "a", timeout_s=200 * 86400)
+    rig = Rig(tmp_path, [spec], ["c/a"])
+    rig.next_codes = [None]
+    rig.tick()
+    (run_id,) = rig.d.active
+    stale = seed(rig, "c/a", timedelta(days=90), seq=2, row_too=False)
+    rig.clock.advance(timedelta(days=40).total_seconds())
+    rig.tick()
+    assert len(prune_calls) == 2 and not (rig.paths.runs_dir / stale).exists()
+    assert (rig.paths.runs_dir / run_id).is_dir() and list(rig.d.active) == [run_id]
+    assert rig.events("runs-pruned")[-1].detail.startswith("1 ")
+
+
+def test_a_prune_that_raises_is_one_tick_error_and_the_next_attempt_waits_a_day(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig = idle_rig(tmp_path)
+    calls: list[datetime] = []
+
+    def broken(runs_dir: Path, keep: set[str], now: datetime) -> list[str]:
+        calls.append(now)
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(dispatcher_module, "prune_run_dirs", broken)
+    for _ in range(3):
+        assert _guarded_tick(rig.d, rig.state, rig.clock)
+        rig.clock.advance(30)
+    assert len(calls) == 1
+    assert [e.detail for e in rig.events("tick-error")] == ["PermissionError: denied"]
+    rig.clock.now_value = calls[0] + PRUNE_EVERY
+    assert _guarded_tick(rig.d, rig.state, rig.clock)
+    assert len(calls) == 2 and len(rig.events("tick-error")) == 2
+
+
+def test_the_prune_runs_after_the_workload_watch_outside_any_critical_section(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig = idle_rig(tmp_path)
+    order: list[str] = []
+    depths: list[int] = []
+    real_watch = rig.d._watch_workload
+
+    def watch(now: datetime) -> None:
+        order.append("watch")
+        real_watch(now)
+
+    def spy(runs_dir: Path, keep: set[str], now: datetime) -> list[str]:
+        order.append("prune")
+        depths.append(rig.d._depth)
+        return []
+
+    monkeypatch.setattr(rig.d, "_watch_workload", watch)
+    monkeypatch.setattr(dispatcher_module, "prune_run_dirs", spy)
+    rig.tick()
+    assert order == ["watch", "prune"] and depths == [0]
+
+
+def test_an_overrun_during_the_prune_ends_the_tick_at_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig = idle_rig(tmp_path)
+
+    def overrun(runs_dir: Path, keep: set[str], now: datetime) -> list[str]:
+        rig.d.overrun(60.0)
+        raise AssertionError("the overrun should have interrupted the prune")
+
+    monkeypatch.setattr(dispatcher_module, "prune_run_dirs", overrun)
+    with pytest.raises(TickOverrun):
+        rig.tick()
