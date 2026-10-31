@@ -13,7 +13,7 @@ def _directives() -> dict[str, str]:
     """Every `key=value` line of the unit, the last one winning."""
     lines = (line.strip() for line in UNIT.read_text().splitlines())
     pairs = (line.partition("=") for line in lines if line and not line.startswith(("#", "[")))
-    return {key: value for key, _, value in pairs}
+    return {key.strip(): value.strip() for key, _, value in pairs}
 
 
 def test_dispatcher_unit_runs_the_repo_venv_in_the_repo() -> None:
