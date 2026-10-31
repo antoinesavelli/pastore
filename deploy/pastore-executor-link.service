@@ -1,0 +1,19 @@
+# Text for ~/.config/systemd/user/pastore-executor-link.service (R26): the workstation's 127.0.0.1:11436 forwards to
+# the executor's Ollama on its own 127.0.0.1:11434 through `second-host` (~/.ssh/config). No network change on the
+# executor. Installed by hand in v5 Phase 4b (D-043), not by the repo. It never gives up: while the executor is away
+# the dispatcher reads `executor-down` from the dead port (R27), and the link comes back on its own.
+[Unit]
+Description=pastore executor link: SSH forward 127.0.0.1:11436 to the executor's Ollama on 127.0.0.1:11434
+Documentation=file:/srv/projects/pastore/docs/STATUS.md
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ssh -N -T -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o ConnectTimeout=10 -o ControlMaster=no -o ControlPath=none -L 127.0.0.1:11436:127.0.0.1:11434 second-host
+Restart=always
+RestartSec=10
+MemoryMax=64M
+MemorySwapMax=0
+
+[Install]
+WantedBy=default.target

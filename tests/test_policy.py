@@ -150,7 +150,7 @@ def test_two_models_of_one_task_are_two_pairs() -> None:
 def test_repo_policy_v2_loads_and_round_trips_byte_for_byte() -> None:
     policy = load_policy(REPO_POLICY)
     assert policy.hosts == {
-        "workstation": Host("workstation", "http://127.0.0.1:11435", 24, 3, 3, 32768),
+        "workstation": Host("workstation", "http://127.0.0.1:11435", 24, 1, 1, 32768),
         "executor": Host("executor", "http://127.0.0.1:11436", 10, 3, 3, 8192),
     }
     assert policy.sources == (
