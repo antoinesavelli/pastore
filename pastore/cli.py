@@ -82,7 +82,10 @@ def _refuse(text: str) -> int:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="pastore", description="GPU job queue.")
+    parser = argparse.ArgumentParser(
+        prog="pastore",
+        description="Manager, scheduler and watchdog for the workstation and executor GPUs.",
+    )
     parser.add_argument("--policy", type=Path, help="policy.yaml to use (default: the repo's)")
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("start")
