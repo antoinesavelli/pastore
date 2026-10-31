@@ -45,6 +45,7 @@ class Host:
     """One machine from `policy.yaml` `hosts:` (R23, R25): Ollama URL, VRAM, model cap, per-model parallelism, context.
 
     `context` is the host Ollama's default context length in tokens (D-041: KV cache per slot is counted at it).
+    `vram_gb` is read by placement as GiB (binary, 2**30 bytes each) despite its name; the name is the policy format.
     """
 
     name: str

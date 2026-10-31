@@ -39,12 +39,12 @@ def kv_bytes_per_slot(layers: int, kv_heads: int, head_dim: int, context: int) -
 
 
 def base_need(size: int) -> int:
-    """VRAM a model needs before its KV cache: size x 1.2 + 1 GiB, rounded up."""
+    """VRAM in bytes a model needs before its KV cache: size x 1.2 + 1 GiB (2**30 bytes), rounded up."""
     return -(-size * 6 // 5) + GIB
 
 
 def need_bytes(facts: ModelFacts, parallel: int) -> int | None:
-    """VRAM a model needs on a host: the loaded figure once seen, else the estimate, None when KV is unknown."""
+    """VRAM in bytes a model needs on a host: the loaded figure once seen, else the estimate, None if KV is unknown."""
     if facts.loaded is not None:
         return facts.loaded
     if facts.kv_per_slot is None:
@@ -53,7 +53,7 @@ def need_bytes(facts: ModelFacts, parallel: int) -> int | None:
 
 
 def free_bytes(load: HostLoad) -> int:
-    """Host VRAM minus the resident models' VRAM minus the need of held models not yet resident."""
+    """Free VRAM in bytes: `vram_gb` as GiB minus the resident models' VRAM minus the need of held, not yet resident, models."""
     free = load.host.vram_gb * GIB - sum(load.resident.values())
     for model in set(load.held).difference(load.resident):
         facts = load.models.get(model)
@@ -65,7 +65,7 @@ def free_bytes(load: HostLoad) -> int:
 
 
 def _required(facts: ModelFacts, load: HostLoad) -> int:
-    """VRAM to compare with the card: the need, or the base need when the KV size is unknown."""
+    """VRAM in bytes to compare with the card (`vram_gb` as GiB): the need, or the base need when the KV size is unknown."""
     need = need_bytes(facts, load.host.parallel)
     return base_need(facts.size) if need is None else need
 

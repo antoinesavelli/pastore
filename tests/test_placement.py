@@ -18,6 +18,7 @@ from pastore.spec import WORKSTATION, Host
 MODEL = "m:latest"
 OTHER = "other:latest"
 SMALL = 2 * GIB
+# Placement reads the policy field `vram_gb=10` as 10 GiB (10 * 2**30 bytes); base_need(EXACT_10_GIB) is exactly that
 OVER_10_GIB = 45 * GIB // 6 + 1
 EXACT_10_GIB = 45 * GIB // 6
 
