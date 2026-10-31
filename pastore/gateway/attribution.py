@@ -88,6 +88,11 @@ def _host_address(proc: Path, ip: _Ip) -> bool:
     return False
 
 
+def is_local(client: _Ip, server: _Ip | None, proc: Path) -> bool:
+    """A client is local when it is loopback, the server's own address, or any address of this host (NAT)."""
+    return client.is_loopback or client == server or _host_address(proc, client)
+
+
 def _nets(values: Sequence[str]) -> tuple[_Net, ...]:
     return tuple(ipaddress.ip_network(v) for v in values)
 
@@ -182,17 +187,13 @@ class Attributor:
         deadline = self._clock() + self._budget_s
         try:
             client, server = _normalize(peer), _normalize(local)
-            if self._is_local(client[0], server[0]):
+            if is_local(client[0], server[0], self._proc):
                 return self._local(client, server, deadline)
             return self._remote(client[0])
         except _Unknown as exc:
             return Attribution(UNKNOWN_LEVEL, exc.label)
         except (OSError, ValueError) as exc:
             return Attribution(UNKNOWN_LEVEL, f"unknown:{type(exc).__name__}")
-
-    def _is_local(self, client: _Ip, server: _Ip) -> bool:
-        """A peer is local when it is loopback, the server's own address, or any address of this host (NAT)."""
-        return client.is_loopback or client == server or _host_address(self._proc, client)
 
     def _remote(self, ip: _Ip) -> Attribution:
         label = f"peer:{ip}"

@@ -165,6 +165,7 @@ async def rig(
     clock: Callable[[], float] = time.monotonic,
     state_paths: StatePaths | None = None,
     upstream_idle_s: float = UPSTREAM_IDLE_S,
+    proc: Path | None = None,
 ) -> AsyncIterator[Rig]:
     async with AsyncExitStack() as stack:
         fakes = {
@@ -185,6 +186,7 @@ async def rig(
             started_at=STARTED_AT,
             starve_after_s=starve_after_s,
             upstream_idle_s=upstream_idle_s,
+            proc=proc or tmp_path / "no-proc",
         )
         cancelled: list[str] = []
 
@@ -757,6 +759,34 @@ def test_a_body_that_keeps_arriving_within_the_limit_is_not_ended(tmp_path: Path
     run(scenario())
 
 
+@pytest.mark.parametrize(
+    ("error", "status", "journalled"),
+    [
+        (aiohttp.ConnectionTimeoutError("c"), 502, "upstream-error"),
+        (aiohttp.SocketTimeoutError("r"), 504, "upstream-idle"),
+    ],
+)
+def test_a_connect_timeout_stays_502_and_only_a_read_timeout_is_504(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+    status: int,
+    journalled: str,
+) -> None:
+    async def fail(*args: Any, **kwargs: Any) -> None:
+        raise error
+
+    async def scenario() -> None:
+        async with rig(tmp_path, [who(Level.REINS)]) as r:
+            monkeypatch.setattr(r.app[SESSION], "request", fail)
+            reply = await r.send("POST", "/api/chat", CHAT)
+            assert reply.status == status and "error" in json.loads(reply.body)
+            await r.wait_journal(1)
+            assert r.entry("m")["status"] == journalled
+
+    run(scenario())
+
+
 # --- check 7: hang-ups -----------------------------------------------------------------------------------------
 
 
@@ -1273,6 +1303,25 @@ MODEL_CHANGE = ("/api/pull", "/api/delete", "/api/create", "/api/copy", "/api/pu
 REFUSED = {"error": "model-changing routes are refused from off this machine"}
 
 
+HOST_FIB_TRIE = """\
+Local:
+  +-- 0.0.0.0/0 3 1 5
+     +-- 192.0.2.128/25 2 0 2
+        |-- 192.0.2.167
+           /32 host LOCAL
+        |-- 192.0.2.255
+           /32 link BROADCAST
+"""
+
+
+def host_proc(tmp_path: Path) -> Path:
+    """A /proc whose fib_trie lists 192.0.2.167 as an address of this host."""
+    root = tmp_path / "host-proc"
+    (root / "net").mkdir(parents=True)
+    (root / "net" / "fib_trie").write_text(HOST_FIB_TRIE)
+    return root
+
+
 def peer_is(monkeypatch: pytest.MonkeyPatch, peer: str, local: str = "192.0.2.1") -> None:
     """Make the gateway see every connection as coming from `peer` to `local`, whatever the socket says."""
     monkeypatch.setattr(server, "_endpoints", lambda request: ((peer, 40000), (local, 11434)))
@@ -1355,6 +1404,57 @@ def test_model_changing_variants_and_any_method_are_refused_off_this_machine(
     run(scenario())
 
 
+@pytest.mark.parametrize(
+    ("peer", "proc_state", "relayed"),
+    [
+        ("192.0.2.167", "listed", True),
+        ("192.0.2.5", "listed", False),
+        ("192.0.2.255", "listed", False),
+        ("192.0.2.167", "missing", False),
+        ("192.0.2.167", "unreadable", False),
+    ],
+)
+def test_a_host_address_peer_on_the_bridge_address_is_relayed_and_an_unlisted_one_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, peer: str, proc_state: str, relayed: bool
+) -> None:
+    proc = host_proc(tmp_path)
+    if proc_state == "missing":
+        (proc / "net" / "fib_trie").unlink()
+    elif proc_state == "unreadable":
+        (proc / "net" / "fib_trie").unlink()
+        (proc / "net" / "fib_trie").mkdir()
+
+    async def scenario() -> None:
+        async with rig(tmp_path, proc=proc) as r:
+            peer_is(monkeypatch, peer, "172.17.0.1")
+            reply = await r.send("POST", "/api/pull", {"model": "m"})
+            assert reply.status == (200 if relayed else 403)
+            assert len(r.fakes[WORKSTATION].requests) == relayed
+
+    run(scenario())
+
+
+def test_the_peer_check_reads_proc_off_the_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    threads: list[int] = []
+    real = server.on_this_machine
+
+    def spy(peer: str, local: str, proc: Path) -> bool:
+        threads.append(threading.get_ident())
+        return real(peer, local, proc)
+
+    monkeypatch.setattr(server, "on_this_machine", spy)
+
+    async def scenario() -> None:
+        async with rig(tmp_path) as r:
+            peer_is(monkeypatch, LAN)
+            assert (await r.send("POST", "/api/pull", {"model": "m"})).status == 403
+            assert threads and threading.get_ident() not in threads
+
+    run(scenario())
+
+
 def test_every_other_route_still_goes_through_from_a_lan_peer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1425,7 +1525,11 @@ def test_the_refusal_line_is_one_sanitised_line_and_a_gone_client_is_refused(
         ("", "", False),
         ("localhost", "192.0.2.1", False),
         ("not-an-ip", "not-an-ip", False),
+        ("192.0.2.167", "172.17.0.1", True),
+        ("192.0.2.167", "192.0.2.1", True),
+        ("192.0.2.5", "172.17.0.1", False),
+        ("192.0.2.255", "172.17.0.1", False),
     ],
 )
-def test_on_this_machine(peer: str, local: str, expected: bool) -> None:
-    assert on_this_machine(peer, local) is expected
+def test_on_this_machine(tmp_path: Path, peer: str, local: str, expected: bool) -> None:
+    assert on_this_machine(peer, local, host_proc(tmp_path)) is expected

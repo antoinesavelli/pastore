@@ -11,12 +11,13 @@ import re
 import sqlite3
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import asdict, dataclass
+from pathlib import Path
 
 import aiohttp
 from aiohttp import web
 from yarl import URL
 
-from pastore.gateway.attribution import Address, Attribution
+from pastore.gateway.attribution import Address, Attribution, is_local
 from pastore.gateway.queue import STARVE_AFTER_S, HostQueue
 from pastore.policy import Policy
 from pastore.spec import WORKSTATION, Level
@@ -80,10 +81,10 @@ def is_loopback(host: str) -> bool:
     return ip is not None and ip.is_loopback
 
 
-def on_this_machine(peer: str, local: str) -> bool:
-    """D-050 (9c): True for a loopback peer, a peer on the connection's own local address, or one in 172.17.0.0/16."""
+def on_this_machine(peer: str, local: str, proc: Path) -> bool:
+    """D-050 (9c): True for a peer in 172.17.0.0/16 or one the attribution calls local (`is_local`, reading `proc`)."""
     ip = _ip(peer)
-    return ip is not None and (ip.is_loopback or ip == _ip(local) or ip in DOCKER_NET)
+    return ip is not None and (ip in DOCKER_NET or is_local(ip, _ip(local), proc))
 
 
 def _token(value: str) -> str:
@@ -154,9 +155,11 @@ class _Gateway:
         log: Callable[[str], None],
         starve_after_s: float,
         started_at: str,
+        proc: Path,
     ) -> None:
         self._policy = policy
         self._started_at = started_at
+        self._proc = proc
         self._attribute = attribute
         self._state_paths = state_paths
         self._clock = clock
@@ -187,7 +190,7 @@ class _Gateway:
             return self._pastore(request)
         if request.method == "POST" and (path in GATED_PATHS or path.startswith(GATED_PREFIX)):
             return await self._gated(request)
-        if (refusal := self._refuse_model_change(request, path)) is not None:
+        if (refusal := await self._refuse_model_change(request, path)) is not None:
             return refusal
         data = request.content if request.can_read_body else None
         return await self._relay(request, self._policy.hosts[WORKSTATION].url, data, _Journal())
@@ -201,7 +204,7 @@ class _Gateway:
         hosts = {name: asdict(queue.snapshot()) for name, queue in self._queues.items()}
         return web.json_response({"hosts": hosts, "started_at": self._started_at})
 
-    def _refuse_model_change(self, request: web.Request, path: str) -> web.Response | None:
+    async def _refuse_model_change(self, request: web.Request, path: str) -> web.Response | None:
         """403 for a model-changing route from a peer that is not on this machine; None for anything else."""
         if posixpath.normpath(re.sub("/+", "/", path)) not in MODEL_CHANGE_PATHS:
             return None
@@ -209,7 +212,9 @@ class _Gateway:
             (peer, _), (local, _) = _endpoints(request)
         except ConnectionResetError:
             peer = local = ""
-        if on_this_machine(peer, local):
+        if await asyncio.get_running_loop().run_in_executor(
+            None, on_this_machine, peer, local, self._proc
+        ):
             return None
         self._log(f"refused route={_token(path)} peer={_token(peer)}")
         error = "model-changing routes are refused from off this machine"
@@ -328,14 +333,15 @@ def make_app(
     started_at: str,
     starve_after_s: float = STARVE_AFTER_S,
     upstream_idle_s: float = UPSTREAM_IDLE_S,
+    proc: Path = Path("/proc"),
 ) -> web.Application:
     """Build the gateway application; the caller runs it with `handler_cancellation=True`.
 
     `started_at` is the gateway's start as UTC ISO-8601; `/pastore/status` reports it, so the dispatcher can tell a
     run that a gateway restart cut short (D-050 (4)). A relayed reply that gets no bytes from the upstream for
-    `upstream_idle_s` is ended.
+    `upstream_idle_s` is ended. `proc` is where the model-changing routes' peer check reads the host's own addresses.
     """
-    gateway = _Gateway(policy, attribute, state_paths, clock, log, starve_after_s, started_at)
+    gateway = _Gateway(policy, attribute, state_paths, clock, log, starve_after_s, started_at, proc)
     app = web.Application(client_max_size=MAX_BODY_BYTES, handler_args={"auto_decompress": False})
     app[UPSTREAM_IDLE] = upstream_idle_s
     app.cleanup_ctx.append(_upstream_session)

@@ -511,6 +511,25 @@ def test_missing_or_malformed_address_files_mean_not_ours(proc: FakeProc) -> Non
     assert neither()
 
 
+@pytest.mark.parametrize(
+    ("client", "server", "expected"),
+    [
+        ("127.0.0.2", "192.0.2.5", True),
+        ("192.0.2.5", "192.0.2.5", True),
+        ("192.0.2.167", "172.17.0.1", True),
+        ("192.0.2.5", "172.17.0.1", False),
+        ("192.0.2.167", None, True),
+        ("192.0.2.5", None, False),
+    ],
+)
+def test_is_local_is_loopback_the_server_address_or_an_address_of_this_host(
+    proc: FakeProc, client: str, server: str | None, expected: bool
+) -> None:
+    proc.addresses()
+    other = ipaddress.ip_address(server) if server else None
+    assert attribution.is_local(ipaddress.ip_address(client), other, proc.root) is expected
+
+
 def test_a_natted_own_host_client_is_local_and_unknown_without_a_socket_row(proc: FakeProc) -> None:
     """A host process arriving as the host's LAN address (Docker MASQUERADE) must not be taken for a Reins device."""
     proc.addresses()
