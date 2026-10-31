@@ -26,7 +26,14 @@ from aiohttp.test_utils import make_mocked_request
 
 import pastore.gateway.server as server
 from pastore.gateway.attribution import Attribution
-from pastore.gateway.server import CLIENT_CLOSED, SESSION, is_loopback, make_app
+from pastore.gateway.server import (
+    CLIENT_CLOSED,
+    SESSION,
+    UPSTREAM_IDLE_S,
+    is_loopback,
+    make_app,
+    on_this_machine,
+)
 from pastore.policy import Policy
 from pastore.spec import WORKSTATION, Host, Level
 from pastore.state import RunRow, StatePaths, default_paths, open_state
@@ -157,6 +164,7 @@ async def rig(
     starve_after_s: float = 600.0,
     clock: Callable[[], float] = time.monotonic,
     state_paths: StatePaths | None = None,
+    upstream_idle_s: float = UPSTREAM_IDLE_S,
 ) -> AsyncIterator[Rig]:
     async with AsyncExitStack() as stack:
         fakes = {
@@ -176,6 +184,7 @@ async def rig(
             log=lines.append,
             started_at=STARTED_AT,
             starve_after_s=starve_after_s,
+            upstream_idle_s=upstream_idle_s,
         )
         cancelled: list[str] = []
 
@@ -676,6 +685,78 @@ def test_an_upstream_that_dies_mid_stream_closes_the_client_connection(tmp_path:
     run(scenario())
 
 
+# --- the upstream idle limit (D-050 (5)) -----------------------------------------------------------------------
+
+
+def test_a_reply_with_no_bytes_before_the_headers_gets_504_and_frees_the_slot(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        async with rig(tmp_path, [who(Level.REINS), who(Level.REINS)], upstream_idle_s=1.0) as r:
+            fake = r.fakes[WORKSTATION]
+            fake.hold = True
+            first = r.chat("A", "m-A")
+            await fake.wait_for_requests(1)
+            second = r.chat("B", "m-B")
+            await r.wait_queued("reins", 1)
+            fake.hold = False
+            stalled, next_in_line = await asyncio.gather(first, second)
+            assert stalled.status == 504
+            assert json.loads(stalled.body) == {
+                "error": "upstream idle: no bytes from Ollama for 1 s"
+            }
+            assert next_in_line.status == 200 and fake.prompts() == ["A", "B"]
+            await r.wait_idle()
+            assert (r.entry("m-A")["status"], r.entry("m-B")["status"]) == ("upstream-idle", "200")
+
+    run(scenario())
+
+
+def test_a_reply_that_goes_quiet_mid_body_is_ended_and_frees_the_slot(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        async with rig(tmp_path, [who(Level.REINS), who(Level.REINS)], upstream_idle_s=1.0) as r:
+            fake = r.fakes[WORKSTATION]
+            fake.pause_after = 1
+            async with r.client.post(r.url + "/api/chat", data=json.dumps(CHAT)) as resp:
+                assert resp.status == 200 and json.loads(await resp.content.readline())["token"]
+                second = r.chat("B", "m-B")
+                await r.wait_queued("reins", 1)
+                fake.pause_after = None
+                with pytest.raises(aiohttp.ClientPayloadError):
+                    await resp.read()
+            assert (await second).status == 200 and fake.prompts()[1] == "B"
+            await r.wait_idle()
+            assert [e["status"] for e in r.journal()] == ["upstream-idle", "200"]
+
+    run(scenario())
+
+
+def test_an_ungated_reply_with_no_bytes_gets_504_and_writes_no_journal_line(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        async with rig(tmp_path, upstream_idle_s=0.3) as r:
+            r.fakes[WORKSTATION].stall = True
+            reply = await r.send("GET", "/api/tags")
+            assert reply.status == 504 and "0.3 s" in json.loads(reply.body)["error"]
+            assert r.journal() == []
+
+    run(scenario())
+
+
+def test_a_body_that_keeps_arriving_within_the_limit_is_not_ended(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        async with rig(tmp_path, [who(Level.REINS)], upstream_idle_s=0.6) as r:
+            fake = r.fakes[WORKSTATION]
+            fake.chunks, fake.delay_s = 12, 0.1
+            reply = await r.send("POST", "/api/chat", CHAT)
+            assert reply.status == 200 and reply.body.endswith(b'{"done": true}\n')
+            await r.wait_journal(1)
+            assert r.journal()[0]["status"] == "200"
+
+    run(scenario())
+
+
 # --- check 7: hang-ups -----------------------------------------------------------------------------------------
 
 
@@ -1170,14 +1251,181 @@ def test_status_refuses_a_peer_that_is_not_loopback(tmp_path: Path) -> None:
     run(scenario())
 
 
-def test_the_upstream_session_has_no_total_or_read_timeout_and_a_connect_timeout(
+def test_the_upstream_session_has_no_total_timeout_a_connect_timeout_and_the_idle_limit(
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
         async with rig(tmp_path) as r:
             session = r.app[SESSION]
-            assert (session.timeout.total, session.timeout.sock_read) == (None, None)
+            assert (session.timeout.total, session.timeout.sock_read) == (None, 300.0)
             assert session.timeout.connect == 3.0
             assert session.connector is not None and session.connector.limit == 0
+        async with rig(tmp_path, upstream_idle_s=7.5) as r:
+            assert r.app[SESSION].timeout.sock_read == 7.5
 
     run(scenario())
+
+
+# --- model-changing routes only from this machine (D-050 (9c)) -------------------------------------------------
+
+LAN, EXECUTOR_IP = "192.0.2.5", "192.0.2.101"
+MODEL_CHANGE = ("/api/pull", "/api/delete", "/api/create", "/api/copy", "/api/push")
+REFUSED = {"error": "model-changing routes are refused from off this machine"}
+
+
+def peer_is(monkeypatch: pytest.MonkeyPatch, peer: str, local: str = "192.0.2.1") -> None:
+    """Make the gateway see every connection as coming from `peer` to `local`, whatever the socket says."""
+    monkeypatch.setattr(server, "_endpoints", lambda request: ((peer, 40000), (local, 11434)))
+
+
+async def raw_status(r: Rig, method: str, target: str) -> int:
+    head = (
+        f"{method} {target} HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )
+    return int((await raw_exchange(r.url, head.encode())).split(b" ", 2)[1])
+
+
+def test_invariant_model_changing_routes_are_refused_off_this_machine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        async with rig(tmp_path, extra_hosts=("executor",)) as r:
+            for peer in (LAN, EXECUTOR_IP, f"::ffff:{LAN}"):
+                peer_is(monkeypatch, peer)
+                for path in MODEL_CHANGE:
+                    reply = await r.send("POST", path, {"model": "m"})
+                    assert reply.status == 403 and json.loads(reply.body) == REFUSED
+                    assert f"refused route={path} peer={peer}" in r.lines
+            assert len(r.lines) == 3 * len(MODEL_CHANGE) and r.journal() == []
+            assert not any(fake.requests for fake in r.fakes.values())
+
+    run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("peer", "local"),
+    [
+        ("127.0.0.1", "127.0.0.1"),
+        ("::1", "::1"),
+        ("::ffff:127.0.0.1", "::ffff:127.0.0.1"),
+        ("172.17.0.9", "192.0.2.1"),
+        (LAN, LAN),
+    ],
+)
+def test_model_changing_routes_are_relayed_from_this_machine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, peer: str, local: str
+) -> None:
+    async def scenario() -> None:
+        async with rig(tmp_path) as r:
+            peer_is(monkeypatch, peer, local)
+            for path in MODEL_CHANGE:
+                reply = await r.send("POST", path, {"model": "m"})
+                assert reply.status == 200 and reply.headers["X-Upstream-Tag"] == WORKSTATION
+            assert [x.target for x in r.fakes[WORKSTATION].requests] == list(MODEL_CHANGE)
+            assert r.lines == []
+
+    run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("method", "target"),
+    [
+        ("POST", "/api/pull/"),
+        ("POST", "//api/pull"),
+        ("POST", "/api//pull"),
+        ("POST", "/api/%70ull"),
+        ("POST", "/api%2Fpull"),
+        ("POST", "/api/./pull"),
+        ("POST", "///api/delete//"),
+        ("POST", "/api/pull?stream=false"),
+        ("DELETE", "/api/delete"),
+        ("GET", "/api/pull"),
+        ("PUT", "/api/copy"),
+    ],
+)
+def test_model_changing_variants_and_any_method_are_refused_off_this_machine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method: str, target: str
+) -> None:
+    async def scenario() -> None:
+        async with rig(tmp_path) as r:
+            peer_is(monkeypatch, LAN)
+            assert await raw_status(r, method, target) == 403
+            assert not r.fakes[WORKSTATION].requests
+
+    run(scenario())
+
+
+def test_every_other_route_still_goes_through_from_a_lan_peer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    others = [
+        ("GET", "/api/tags"),
+        ("GET", "/api/ps"),
+        ("POST", "/api/show"),
+        ("GET", "/api/version"),
+        ("POST", "/api/blobs/sha256:abc"),
+        ("POST", "/api/pulled"),
+        ("POST", "/api/pull/x"),
+    ]
+
+    async def scenario() -> None:
+        async with rig(tmp_path, [who(Level.REINS)]) as r:
+            peer_is(monkeypatch, LAN)
+            for method, target in others:
+                assert await raw_status(r, method, target) == 200
+            assert (await r.send("POST", "/api/chat", CHAT)).status == 200
+            assert [x.target for x in r.fakes[WORKSTATION].requests] == [t for _, t in others] + [
+                "/api/chat"
+            ]
+            assert not [line for line in r.lines if line.startswith("refused")]
+
+    run(scenario())
+
+
+def test_the_refusal_line_is_one_sanitised_line_and_a_gone_client_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        async with rig(tmp_path) as r:
+            peer_is(monkeypatch, LAN)
+            assert await raw_status(r, "GET", "/api/pull/%20X/..") == 403
+            assert r.lines == [f"refused route=/api/pull/_X/.. peer={LAN}"]
+            monkeypatch.undo()
+            request = make_mocked_request("POST", "/api/pull", app=r.app)
+            request.protocol.transport = None
+            handler = (await r.app.router.resolve(request)).handler
+            assert (await handler(request)).status == 403
+            assert r.lines[-1] == "refused route=/api/pull peer=-"
+            assert not r.fakes[WORKSTATION].requests
+
+    run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("peer", "local", "expected"),
+    [
+        ("127.0.0.1", "192.0.2.1", True),
+        ("127.8.9.10", "192.0.2.1", True),
+        ("::1", "fe80::1", True),
+        ("::ffff:127.0.0.1", "192.0.2.1", True),
+        ("192.0.2.5", "192.0.2.5", True),
+        ("::ffff:192.0.2.5", "192.0.2.5", True),
+        ("192.0.2.5", "::ffff:192.0.2.5", True),
+        ("fe80::1", "fe80::1", True),
+        ("172.17.0.1", "192.0.2.1", True),
+        ("172.17.255.255", "192.0.2.1", True),
+        ("::ffff:172.17.0.9", "192.0.2.1", True),
+        ("172.18.0.1", "192.0.2.1", False),
+        ("172.16.255.255", "192.0.2.1", False),
+        ("192.0.2.5", "192.0.2.6", False),
+        ("::ffff:192.0.2.5", "192.0.2.6", False),
+        ("fe80::1", "fe80::2", False),
+        ("192.0.2.5", "", False),
+        ("", "192.0.2.1", False),
+        ("", "", False),
+        ("localhost", "192.0.2.1", False),
+        ("not-an-ip", "not-an-ip", False),
+    ],
+)
+def test_on_this_machine(peer: str, local: str, expected: bool) -> None:
+    assert on_this_machine(peer, local) is expected

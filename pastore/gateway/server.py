@@ -6,6 +6,7 @@ Depends on: aiohttp, pastore.gateway.attribution and .queue, pastore.policy, pas
 import asyncio
 import ipaddress
 import json
+import posixpath
 import re
 import sqlite3
 from collections.abc import AsyncIterator, Callable, Mapping
@@ -36,14 +37,20 @@ DROP_REQUEST = HOP_BY_HOP | {"host", "content-length"}
 DROP_RESPONSE = HOP_BY_HOP | {"content-length", "date", "server"}
 GATED_PATHS = frozenset({"/api/generate", "/api/chat", "/api/embed", "/api/embeddings"})
 GATED_PREFIX = "/v1/"
+MODEL_CHANGE_PATHS = frozenset(
+    {"/api/pull", "/api/delete", "/api/create", "/api/copy", "/api/push"}
+)
+DOCKER_NET = ipaddress.IPv4Network("172.17.0.0/16")
 SKIP_AUTO_HEADERS = ("Accept", "Accept-Encoding", "Content-Type", "User-Agent")
 CONNECT_TIMEOUT_S = 3.0
+UPSTREAM_IDLE_S = 300.0
 MAX_BODY_BYTES = 64 * 1024 * 1024
 MODEL_PARSE_MAX_BYTES = 1024 * 1024
 CLIENT_CLOSED = 499
 STATUS_PATH = "/pastore/status"
 UNSAFE = re.compile(r"[^A-Za-z0-9._:/@+-]")
 SESSION = web.AppKey("session", aiohttp.ClientSession)
+UPSTREAM_IDLE = web.AppKey("upstream_idle_s", float)
 
 
 @dataclass
@@ -58,15 +65,25 @@ class _Journal:
     status: str = "500"
 
 
-def is_loopback(host: str) -> bool:
-    """True for 127.0.0.0/8, ::1 and ::ffff:127.x.x.x; an address that does not parse is not loopback."""
+def _ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """`host` as an address, an IPv4-mapped IPv6 one read as its IPv4 address; None when it does not parse."""
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
-        return False
-    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
-        ip = ip.ipv4_mapped
-    return ip.is_loopback
+        return None
+    return ip.ipv4_mapped if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped else ip
+
+
+def is_loopback(host: str) -> bool:
+    """True for 127.0.0.0/8, ::1 and ::ffff:127.x.x.x; an address that does not parse is not loopback."""
+    ip = _ip(host)
+    return ip is not None and ip.is_loopback
+
+
+def on_this_machine(peer: str, local: str) -> bool:
+    """D-050 (9c): True for a loopback peer, a peer on the connection's own local address, or one in 172.17.0.0/16."""
+    ip = _ip(peer)
+    return ip is not None and (ip.is_loopback or ip == _ip(local) or ip in DOCKER_NET)
 
 
 def _token(value: str) -> str:
@@ -98,6 +115,11 @@ def _endpoints(request: web.Request) -> tuple[Address, Address]:
     return (peer[0], peer[1]), (local[0], local[1])
 
 
+def _failure(exc: Exception) -> str:
+    """The journal status of an upstream failure: `upstream-idle` for the idle limit, else `upstream-error`."""
+    return "upstream-idle" if isinstance(exc, aiohttp.SocketTimeoutError) else "upstream-error"
+
+
 async def _pump(
     request: web.Request,
     upstream: aiohttp.ClientResponse,
@@ -112,8 +134,8 @@ async def _pump(
         await response.write_eof()
     except ConnectionResetError:
         journal.status = "hangup"
-    except (aiohttp.ClientError, TimeoutError):
-        journal.status = "upstream-error"
+    except (aiohttp.ClientError, TimeoutError) as exc:
+        journal.status = _failure(exc)
         if request.transport is not None:
             request.transport.close()
     else:
@@ -157,7 +179,7 @@ class _Gateway:
         )
 
     async def handle(self, request: web.Request) -> web.StreamResponse:
-        """Serve one request: the status page, a gated inference request, or an ungated pass-through."""
+        """Serve one request: the status page, a gated inference request, a refusal or an ungated pass-through."""
         if not request.raw_path.startswith("/"):
             raise web.HTTPBadRequest()
         path = request.path
@@ -165,6 +187,8 @@ class _Gateway:
             return self._pastore(request)
         if request.method == "POST" and (path in GATED_PATHS or path.startswith(GATED_PREFIX)):
             return await self._gated(request)
+        if (refusal := self._refuse_model_change(request, path)) is not None:
+            return refusal
         data = request.content if request.can_read_body else None
         return await self._relay(request, self._policy.hosts[WORKSTATION].url, data, _Journal())
 
@@ -176,6 +200,20 @@ class _Gateway:
             raise web.HTTPForbidden()
         hosts = {name: asdict(queue.snapshot()) for name, queue in self._queues.items()}
         return web.json_response({"hosts": hosts, "started_at": self._started_at})
+
+    def _refuse_model_change(self, request: web.Request, path: str) -> web.Response | None:
+        """403 for a model-changing route from a peer that is not on this machine; None for anything else."""
+        if posixpath.normpath(re.sub("/+", "/", path)) not in MODEL_CHANGE_PATHS:
+            return None
+        try:
+            (peer, _), (local, _) = _endpoints(request)
+        except ConnectionResetError:
+            peer = local = ""
+        if on_this_machine(peer, local):
+            return None
+        self._log(f"refused route={_token(path)} peer={_token(peer)}")
+        error = "model-changing routes are refused from off this machine"
+        return web.json_response({"error": error}, status=403)
 
     async def _gated(self, request: web.Request) -> web.StreamResponse:
         started = self._clock()
@@ -250,7 +288,10 @@ class _Gateway:
                 allow_redirects=False,
             )
         except (aiohttp.ClientError, TimeoutError) as exc:
-            journal.status = "upstream-error"
+            journal.status = _failure(exc)
+            if journal.status == "upstream-idle":
+                idle = f"upstream idle: no bytes from Ollama for {request.app[UPSTREAM_IDLE]:g} s"
+                return web.json_response({"error": idle}, status=504)
             return web.json_response({"error": f"upstream unreachable: {exc}"}, status=502)
         async with upstream:
             response = web.StreamResponse(
@@ -263,10 +304,12 @@ class _Gateway:
 
 
 async def _upstream_session(app: web.Application) -> AsyncIterator[None]:
-    """One upstream client for the app's life: no pool limit, 3 s to connect, no read or total timeout."""
+    """One upstream client for the app's life: no pool limit, 3 s to connect, no total timeout, the idle limit per read."""
     session = aiohttp.ClientSession(
         connector=aiohttp.TCPConnector(limit=0),
-        timeout=aiohttp.ClientTimeout(total=None, connect=CONNECT_TIMEOUT_S),
+        timeout=aiohttp.ClientTimeout(
+            total=None, connect=CONNECT_TIMEOUT_S, sock_read=app[UPSTREAM_IDLE]
+        ),
         auto_decompress=False,
         skip_auto_headers=SKIP_AUTO_HEADERS,
     )
@@ -284,14 +327,17 @@ def make_app(
     log: Callable[[str], None],
     started_at: str,
     starve_after_s: float = STARVE_AFTER_S,
+    upstream_idle_s: float = UPSTREAM_IDLE_S,
 ) -> web.Application:
     """Build the gateway application; the caller runs it with `handler_cancellation=True`.
 
     `started_at` is the gateway's start as UTC ISO-8601; `/pastore/status` reports it, so the dispatcher can tell a
-    run that a gateway restart cut short (D-050 (4)).
+    run that a gateway restart cut short (D-050 (4)). A relayed reply that gets no bytes from the upstream for
+    `upstream_idle_s` is ended.
     """
     gateway = _Gateway(policy, attribute, state_paths, clock, log, starve_after_s, started_at)
     app = web.Application(client_max_size=MAX_BODY_BYTES, handler_args={"auto_decompress": False})
+    app[UPSTREAM_IDLE] = upstream_idle_s
     app.cleanup_ctx.append(_upstream_session)
     app.router.add_route("*", "/{tail:.*}", gateway.handle)
     return app

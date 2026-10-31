@@ -88,8 +88,9 @@ def _wants_stream(body: bytes) -> bool:
 class FakeUpstream:
     """An Ollama-like server: NDJSON and SSE streams, JSON answers, a 503 mode, a cut mode, a hold mode.
 
-    `compress` gzips JSON answers; `hold` makes a request wait on `release` before it answers; `pause_after=k` makes
-    a stream wait on `release` after k chunks; `aborted` counts streams whose reader went away.
+    `compress` gzips JSON answers; `hold` makes an inference request wait on `release` before it answers and `stall`
+    does the same for every request; `pause_after=k` makes a stream wait on `release` after k chunks; `aborted` counts
+    streams whose reader went away.
     """
 
     def __init__(
@@ -100,6 +101,7 @@ class FakeUpstream:
         self.chunks = chunks
         self.delay_s = delay_s
         self.hold = False
+        self.stall = False
         self.compress = False
         self.pause_after: int | None = None
         self.release = asyncio.Event()
@@ -140,7 +142,7 @@ class FakeUpstream:
             Recorded(request.method, request.raw_path, dict(request.headers), body)
         )
         inference = request.method == "POST" and request.path in INFERENCE
-        if self.hold and inference:
+        if self.stall or (self.hold and inference):
             await self.release.wait()
         if self.mode == "503":
             return web.json_response(
