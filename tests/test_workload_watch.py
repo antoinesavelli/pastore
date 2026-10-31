@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from pastore import workload_watch as tw
+from pastore import workload_watch as ww
 from pastore.spec import PatternSignal, ValueSignal, WatchConfig
 from pastore.workload_watch import Disruption, JournalError, Line, Overlap, Span
 
@@ -50,14 +50,14 @@ def engine(minutes: float, message: str) -> Line:
     return Line(at(minutes), WORKLOAD_UNIT, message)
 
 
-def watch(now: datetime, spans: Sequence[Span], read: tw.JournalReader) -> tw.Watch:
+def watch(now: datetime, spans: Sequence[Span], read: ww.JournalReader) -> ww.Watch:
     """The watch under CONFIG."""
-    return tw.watch(CONFIG, now, spans, read)
+    return ww.watch(CONFIG, now, spans, read)
 
 
 def disruptions(lines: Sequence[Line]) -> list[Disruption]:
     """The disruptions under CONFIG."""
-    return tw.disruptions(CONFIG, lines)
+    return ww.disruptions(CONFIG, lines)
 
 
 def span(start: float, end: float | None, run_id: str = "r1", ref: str = "example/eval") -> Span:
@@ -65,7 +65,7 @@ def span(start: float, end: float | None, run_id: str = "r1", ref: str = "exampl
     return Span(run_id, ref, at(start), None if end is None else at(end))
 
 
-def fixed(lines: Sequence[Line]) -> tw.JournalReader:
+def fixed(lines: Sequence[Line]) -> ww.JournalReader:
     """A reader that serves the given lines per unit."""
     return lambda unit, since: [ln for ln in lines if ln.unit == unit]
 
@@ -96,9 +96,9 @@ class Journal:
         return subprocess.CompletedProcess(list(argv), self.returncode, out, "")
 
 
-def one_line(raw: str) -> tw.JournalReader:
+def one_line(raw: str) -> ww.JournalReader:
     """A reader over one health journal line."""
-    return tw.journal_reader(Journal({HEALTH_UNIT: [raw]}))
+    return ww.journal_reader(Journal({HEALTH_UNIT: [raw]}))
 
 
 def test_check_15_the_watched_units_are_each_read_once_in_first_seen_order() -> None:
@@ -152,20 +152,20 @@ def test_check_15_a_transition_before_the_run_start_does_not_overlap(
 def test_check_15_up_throughout_is_armed_with_no_overlap() -> None:
     lines = [reach(m, True) for m in (-10, 0, 10, 20)]
     result = watch(at(25), [span(0, None)], fixed(lines))
-    assert result == tw.Watch("armed", ())
+    assert result == ww.Watch("armed", ())
 
 
 def test_check_15_down_the_whole_window_is_down_with_no_overlap() -> None:
     lines = [reach(m, False) for m in (-10, 0, 10, 20)]
     result = watch(at(25), [span(-12, None)], fixed(lines))
-    assert result == tw.Watch("down", ())
+    assert result == ww.Watch("down", ())
     assert disruptions([reach(0, False), reach(5, False)]) == []
 
 
 def test_check_15_back_up_then_down_during_a_run_is_an_overlap() -> None:
     lines = [reach(-10, False), reach(5, True), reach(20, False)]
     spans = [span(0, None)]
-    assert watch(at(10), spans, fixed(lines[:2])) == tw.Watch("armed", ())
+    assert watch(at(10), spans, fixed(lines[:2])) == ww.Watch("armed", ())
     result = watch(at(25), spans, fixed(lines))
     assert result.status == "down"
     assert [o.disruption for o in result.overlaps] == [Disruption("health", at(20), None)]
@@ -182,7 +182,7 @@ def test_check_15_a_workload_that_stays_down_keeps_its_overlap_on_later_reads() 
 def test_check_15_a_disruption_ending_before_the_run_does_not_overlap() -> None:
     lines = [reach(-30, True), reach(-20, False), reach(-10, True)]
     result = watch(at(5), [span(0, None)], fixed(lines))
-    assert result == tw.Watch("armed", ())
+    assert result == ww.Watch("armed", ())
 
 
 def test_check_15_lag_900_is_good_and_901_is_bad() -> None:
@@ -223,8 +223,8 @@ def test_check_15_either_link_alarm_text_starts_a_link_disruption(alarm: str) ->
 
 
 def test_check_15_no_lines_is_no_signal() -> None:
-    assert watch(at(20), [span(0, 30)], fixed([])) == tw.Watch("no-signal", ())
-    assert watch(at(20), [], fixed([])) == tw.Watch("no-signal", ())
+    assert watch(at(20), [span(0, 30)], fixed([])) == ww.Watch("no-signal", ())
+    assert watch(at(20), [], fixed([])) == ww.Watch("no-signal", ())
 
 
 def test_check_15_status_comes_from_the_newest_sample_in_the_last_30_minutes() -> None:
@@ -252,7 +252,7 @@ def test_check_15_unread_journal_is_unreadable_and_never_raises() -> None:
     def broken(unit: str, since: datetime) -> list[Line]:
         raise JournalError("journalctl exit 1")
 
-    assert watch(at(20), [span(0, 30)], broken) == tw.Watch("unreadable: journalctl exit 1", ())
+    assert watch(at(20), [span(0, 30)], broken) == ww.Watch("unreadable: journalctl exit 1", ())
 
 
 def test_check_15_end_to_end_through_the_journalctl_reader() -> None:
@@ -262,7 +262,7 @@ def test_check_15_end_to_end_through_the_journalctl_reader() -> None:
             WORKLOAD_UNIT: [entry(at(12), LOST)],
         }
     )
-    result = watch(at(20), [span(0, 30)], tw.journal_reader(journal))
+    result = watch(at(20), [span(0, 30)], ww.journal_reader(journal))
     assert result.status == "down"
     assert [o.disruption.signal for o in result.overlaps] == ["health", "link"]
 
@@ -307,7 +307,7 @@ def test_check_15_a_lag_number_too_large_to_parse_is_over_the_limit_not_an_error
 def test_check_15_overlap_order_is_disruption_start_then_run_id() -> None:
     found = [Disruption("link", at(12), None), Disruption("health", at(10), at(11))]
     spans = [span(0, None, "b-run"), span(5, 30, "a-run"), span(11, None, "c-run")]
-    got = [(o.disruption.start, o.span.run_id) for o in tw.overlaps(spans, found)]
+    got = [(o.disruption.start, o.span.run_id) for o in ww.overlaps(spans, found)]
     assert got == [
         (at(10), "a-run"),
         (at(10), "b-run"),
@@ -318,7 +318,7 @@ def test_check_15_overlap_order_is_disruption_start_then_run_id() -> None:
 
 
 def test_check_15_a_run_that_started_after_the_disruption_does_not_overlap() -> None:
-    assert tw.overlaps([span(11, None)], [Disruption("link", at(10), None)]) == []
+    assert ww.overlaps([span(11, None)], [Disruption("link", at(10), None)]) == []
 
 
 def test_check_15_key_and_detail_hold_only_our_own_fields() -> None:
@@ -341,11 +341,11 @@ def test_check_15_key_and_detail_hold_only_our_own_fields() -> None:
 
 def test_check_15_read_since_is_the_earlier_of_the_status_window_and_the_lookback() -> None:
     now = at(60)
-    assert tw.read_since(now, []) == at(30)
-    assert tw.read_since(now, [span(55, None)]) == at(30)
-    assert tw.read_since(now, [span(40, 50)]) == at(25)
-    assert tw.read_since(now, [span(50, None), span(10, 20), span(40, 41)]) == at(-5)
-    assert tw.read_since(now, [span(45, None)]) == at(30)
+    assert ww.read_since(now, []) == at(30)
+    assert ww.read_since(now, [span(55, None)]) == at(30)
+    assert ww.read_since(now, [span(40, 50)]) == at(25)
+    assert ww.read_since(now, [span(50, None), span(10, 20), span(40, 41)]) == at(-5)
+    assert ww.read_since(now, [span(45, None)]) == at(30)
 
 
 # --- check 15: the journalctl reader ---------------------------------------------------------
@@ -354,7 +354,7 @@ def test_check_15_read_since_is_the_earlier_of_the_status_window_and_the_lookbac
 def test_check_15_the_reader_runs_exactly_the_documented_journalctl_argv() -> None:
     journal = Journal()
     since = datetime(2026, 10, 31, 12, 0, 7, 900000, tzinfo=UTC)
-    assert tw.journal_reader(journal)(WORKLOAD_UNIT, since) == []
+    assert ww.journal_reader(journal)(WORKLOAD_UNIT, since) == []
     assert journal.calls == [
         [
             "journalctl",
@@ -372,7 +372,7 @@ def test_check_15_the_reader_runs_exactly_the_documented_journalctl_argv() -> No
 
 def test_check_15_watch_reads_both_units_with_no_ssh_and_no_user_scope() -> None:
     journal = Journal()
-    watch(at(20), [span(0, 30)], tw.journal_reader(journal))
+    watch(at(20), [span(0, 30)], ww.journal_reader(journal))
     assert [c[2] for c in journal.calls] == list(CONFIG.units)
     for argv in journal.calls:
         assert argv[0] == "journalctl"
@@ -382,7 +382,7 @@ def test_check_15_watch_reads_both_units_with_no_ssh_and_no_user_scope() -> None
 
 
 def test_check_15_the_module_source_has_no_ssh_user_scope_or_sudo() -> None:
-    source = Path(tw.__file__).read_text(encoding="utf-8")
+    source = Path(ww.__file__).read_text(encoding="utf-8")
     assert not re.search(r"\b(ssh|sudo|pkexec|systemctl)\b|--user", source)
 
 
@@ -390,9 +390,9 @@ def test_check_15_the_module_source_has_no_ssh_user_scope_or_sudo() -> None:
 def test_check_15_a_journalctl_failure_is_unreadable(returncode: int) -> None:
     journal = Journal({HEALTH_UNIT: [entry(at(0), UP)]}, returncode=returncode)
     with pytest.raises(JournalError, match=f"^journalctl exit {returncode}$"):
-        tw.journal_reader(journal)(HEALTH_UNIT, at(-30))
-    result = watch(at(20), [], tw.journal_reader(journal))
-    assert result == tw.Watch(f"unreadable: journalctl exit {returncode}", ())
+        ww.journal_reader(journal)(HEALTH_UNIT, at(-30))
+    result = watch(at(20), [], ww.journal_reader(journal))
+    assert result == ww.Watch(f"unreadable: journalctl exit {returncode}", ())
 
 
 @pytest.mark.parametrize(
@@ -421,7 +421,7 @@ def test_check_15_a_malformed_journal_line_raises_a_journal_error(raw: str) -> N
 def test_check_15_a_malformed_journal_makes_the_watch_unreadable_with_our_words_only() -> None:
     secret = "SECRET-journal-text"
     journal = Journal({HEALTH_UNIT: [entry(at(0), UP), "{" + secret]})
-    result = watch(at(20), [], tw.journal_reader(journal))
+    result = watch(at(20), [], ww.journal_reader(journal))
     assert result.status.startswith("unreadable: ")
     assert secret not in result.status and len(result.status) < 80
     assert result.overlaps == ()
@@ -432,14 +432,14 @@ def test_check_15_a_message_that_is_not_text_is_skipped() -> None:
     missing = json.dumps({"__REALTIME_TIMESTAMP": str(micros(at(2)))})
     null = entry(at(3), None)
     journal = Journal({HEALTH_UNIT: [binary, missing, null, entry(at(4), UP)]})
-    got = tw.journal_reader(journal)(HEALTH_UNIT, at(-30))
+    got = ww.journal_reader(journal)(HEALTH_UNIT, at(-30))
     assert got == [Line(at(4), HEALTH_UNIT, UP)]
 
 
 def test_check_15_the_reader_returns_sorted_aware_utc_lines_with_microseconds() -> None:
     late = at(5) + timedelta(microseconds=123456)
     journal = Journal({WORKLOAD_UNIT: [entry(late, "b"), entry(at(1), "a"), "", "   "]})
-    got = tw.journal_reader(journal)(WORKLOAD_UNIT, at(-30))
+    got = ww.journal_reader(journal)(WORKLOAD_UNIT, at(-30))
     assert [ln.message for ln in got] == ["a", "b"]
     assert [ln.at for ln in got] == [at(1), late]
     assert all(ln.unit == WORKLOAD_UNIT and ln.at.utcoffset() == timedelta(0) for ln in got)
@@ -468,14 +468,14 @@ def test_check_15_terminal_escapes_in_a_message_stay_out_of_the_overlap_detail()
 def test_check_15_a_line_matching_both_good_and_bad_is_bad() -> None:
     both = WatchConfig("s", (PatternSignal("s", HEALTH_UNIT, "fine", "fine but slow"),))
     lines = [Line(at(0), HEALTH_UNIT, "fine"), Line(at(5), HEALTH_UNIT, "fine but slow")]
-    assert tw.disruptions(both, lines) == [Disruption("s", at(5), None)]
+    assert ww.disruptions(both, lines) == [Disruption("s", at(5), None)]
 
 
 def test_check_15_the_status_comes_from_the_signal_the_config_names() -> None:
     by_link = WatchConfig("link", CONFIG.signals)
     lines = [reach(10, True), engine(12, LOST)]
-    assert tw.watch(by_link, at(20), [], fixed(lines)).status == "down"
-    assert tw.watch(by_link, at(20), [], fixed(lines[:1])).status == "no-signal"
+    assert ww.watch(by_link, at(20), [], fixed(lines)).status == "down"
+    assert ww.watch(by_link, at(20), [], fixed(lines[:1])).status == "no-signal"
     assert watch(at(20), [], fixed(lines)).status == "armed"
 
 
@@ -488,12 +488,12 @@ def test_check_15_a_value_that_is_not_digits_or_not_captured_is_no_sample() -> N
     word = WatchConfig("n", (ValueSignal("n", HEALTH_UNIT, r"n=(\w+)", 10),))
     odd = ["n=abc", "n=\u00b2", "n=", "n=-1", "n=1.5x"]
     lines = [Line(at(m), HEALTH_UNIT, text) for m, text in enumerate(["n=5", *odd])]
-    assert tw.disruptions(word, lines) == []
+    assert ww.disruptions(word, lines) == []
     lines.append(Line(at(9), HEALTH_UNIT, "n=11"))
-    assert tw.disruptions(word, lines) == [Disruption("n", at(9), None)]
+    assert ww.disruptions(word, lines) == [Disruption("n", at(9), None)]
     optional = WatchConfig("n", (ValueSignal("n", HEALTH_UNIT, r"m(=\d+)?", 10),))
     assert (
-        tw.disruptions(optional, [Line(at(0), HEALTH_UNIT, "m=5"), Line(at(1), HEALTH_UNIT, "m")])
+        ww.disruptions(optional, [Line(at(0), HEALTH_UNIT, "m=5"), Line(at(1), HEALTH_UNIT, "m")])
         == []
     )
 
@@ -504,8 +504,8 @@ def test_check_15_a_value_limit_is_inclusive_and_leading_zeros_do_not_count() ->
         Line(at(m), HEALTH_UNIT, f"n={v}")
         for m, v in enumerate(("0", "010", "10", "0000000000010"))
     ]
-    assert tw.disruptions(config, ok) == []
+    assert ww.disruptions(config, ok) == []
     bad = [Line(at(0), HEALTH_UNIT, "n=1"), Line(at(1), HEALTH_UNIT, "n=11")]
-    assert tw.disruptions(config, bad) == [Disruption("n", at(1), None)]
+    assert ww.disruptions(config, bad) == [Disruption("n", at(1), None)]
     nine = [Line(at(0), HEALTH_UNIT, "n=1"), Line(at(1), HEALTH_UNIT, "n=" + "9" * 9)]
-    assert tw.disruptions(config, nine) == [Disruption("n", at(1), None)]
+    assert ww.disruptions(config, nine) == [Disruption("n", at(1), None)]
