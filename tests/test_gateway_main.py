@@ -1,6 +1,6 @@
 """The gateway entry point and its unit: refuses a bad policy, falls back to the last good copy, wires hang-up cancellation, points at policy.yaml.
 
-Depends on: pastore.gateway.__main__, pastore.policy, deploy/pastore-gateway.service and the repo's policy.yaml.
+Depends on: pastore.gateway.__main__, pastore.policy, deploy/pastore-gateway.service and the repo's policy.example.yaml.
 """
 
 import os
@@ -15,9 +15,9 @@ from pastore.gateway import __main__ as entry
 from pastore.policy import Policy, PolicyError, load_policy, parse_policy
 
 ROOT = Path(__file__).resolve().parent.parent
-REPO_POLICY = ROOT / "policy.yaml"
+EXAMPLE_POLICY = ROOT / "policy.example.yaml"
 UNIT = ROOT / "deploy" / "pastore-gateway.service"
-GOOD = REPO_POLICY.read_text()
+GOOD = EXAMPLE_POLICY.read_text()
 OTHER = GOOD.replace("context: 32768", "context: 16384")
 WARNING = "<4>pastore gateway: "
 
@@ -73,20 +73,20 @@ def test_serves_with_handler_cancellation(monkeypatch: pytest.MonkeyPatch) -> No
         seen.update(kwargs, app=app)
 
     monkeypatch.setattr(entry.web, "run_app", fake_run_app)
-    assert entry.main(["--policy", str(REPO_POLICY), "--host", "127.0.0.1", "--port", "0"]) == 0
+    assert entry.main(["--policy", str(EXAMPLE_POLICY), "--host", "127.0.0.1", "--port", "0"]) == 0
     assert isinstance(seen["app"], web.Application)
     assert (seen["host"], seen["port"], seen["handler_cancellation"]) == ("127.0.0.1", 0, True)
 
 
 def test_unit_policy_argument_is_the_repo_policy_yaml() -> None:
-    """The unit's --policy names policy.yaml under its WorkingDirectory, and load_policy accepts that file."""
+    """The unit's --policy names policy.yaml under its WorkingDirectory (%h/pastore); load_policy accepts the example it is copied from."""
     lines = {k: v for k, _, v in (line.partition("=") for line in UNIT.read_text().splitlines())}
     argv = shlex.split(lines["ExecStart"])
     arg = Path(argv[argv.index("--policy") + 1])
-    assert arg.is_absolute()
+    assert arg.parts[0] == "%h"
     assert arg.relative_to(lines["WorkingDirectory"]) == Path("policy.yaml")
-    policy = load_policy(ROOT / arg.relative_to(lines["WorkingDirectory"]))
-    assert {"workstation", "executor"} <= policy.hosts.keys()
+    policy = load_policy(EXAMPLE_POLICY)
+    assert "workstation" in policy.hosts and len(policy.hosts) >= 2
 
 
 def test_a_good_policy_writes_the_copy_with_identical_bytes(

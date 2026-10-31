@@ -1,4 +1,4 @@
-"""Check 11: Ollama decode throughput of one model, workstation alone, executor alone, both at once.
+"""Check 11: Ollama decode throughput of one model on the workstation alone, on the second Ollama host (the executor) alone, and on both at once.
 
 Depends on: stdlib only (argparse, http.client, json, pathlib, queue, statistics, sys, threading, time, typing, urllib.parse). Usage, from the repo root:
 `uv run python deploy/measure_throughput.py --model <m> --out <results.json> [--workstation URL] [--executor URL] [--repeats N] [--num-predict N]`

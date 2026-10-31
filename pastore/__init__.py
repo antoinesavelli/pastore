@@ -1,4 +1,4 @@
-"""pastore: manager, scheduler and watchdog for the workstation and executor GPUs, and the Ollama front door.
+"""pastore: manager, scheduler and watchdog for the workstation and a second Ollama host, and the Ollama front door.
 
-Depends on: docs/DESIGN-v5.md (the v5 spec) and docs/DESIGN.md (the v4 spec and module split).
+Depends on: docs/DESIGN.md (the spec and module split).
 """

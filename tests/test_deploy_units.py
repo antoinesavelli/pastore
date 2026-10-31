@@ -1,4 +1,4 @@
-"""The dispatcher's user unit kept in deploy/: the directives a rebuilt host needs, and that it is a user unit.
+"""The dispatcher's user unit template kept in deploy/: the directives a rebuilt host needs, and that it is a user unit.
 
 Depends on: deploy/pastore.service.
 """
@@ -17,20 +17,20 @@ def _directives() -> dict[str, str]:
 
 
 def test_dispatcher_unit_runs_the_repo_venv_in_the_repo() -> None:
-    """The dispatcher starts from the repo's own .venv, which `uv sync` keeps, in the repo directory."""
+    """The dispatcher starts from the repo's own .venv, which `uv sync` keeps, in the repo directory (%h/pastore)."""
     unit = _directives()
-    assert unit["ExecStart"] == "/srv/projects/pastore/.venv/bin/python -m pastore start"
-    assert unit["WorkingDirectory"] == "/srv/projects/pastore"
+    assert unit["ExecStart"] == "%h/pastore/.venv/bin/python -m pastore start"
+    assert unit["WorkingDirectory"] == "%h/pastore"
 
 
-def test_dispatcher_unit_restarts_on_failure_only_and_pages() -> None:
-    """A crash restarts after 60 s, a graceful stop stays stopped, five failures an hour give up and page."""
+def test_dispatcher_unit_restarts_on_failure_only_and_gives_up() -> None:
+    """A crash restarts after 60 s, a graceful stop stays stopped, five failures an hour give up (the template names no OnFailure= hook)."""
     unit = _directives()
     assert unit["Restart"] == "on-failure"
     assert unit["RestartSec"] == "60"
     assert unit["StartLimitBurst"] == "5"
     assert unit["StartLimitIntervalSec"] == "1h"
-    assert unit["OnFailure"] == "unit-failed@%n.service"
+    assert "OnFailure" not in unit
 
 
 def test_dispatcher_unit_is_a_user_unit_without_sudo() -> None:

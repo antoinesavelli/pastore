@@ -1,18 +1,16 @@
-# Text for ~/.config/systemd/user/pastore.service (the dispatcher). Installed by hand, copied from this file, then
-# `systemctl --user daemon-reload` (ask-first, AGENTS.md); not installed by the repo. The directives are copied
-# verbatim from the installed unit. The Description= still has v4 wording ("night-shift"): kept so this file matches
-# what is installed; Phase 8 of docs/plans/2026-10-25-pastore-v5.md refreshes it when it installs the final unit.
+# Template for ~/.config/systemd/user/pastore.service (the dispatcher). Copy it, check that the checkout is at
+# ~/pastore (otherwise edit WorkingDirectory= and ExecStart=), then `systemctl --user daemon-reload`.
+# Not installed by the repo.
 [Unit]
-Description=pastore night-shift GPU job dispatcher (workstation; jobs listed in /srv/projects/pastore/policy.yaml)
-Documentation=file:/srv/projects/pastore/docs/STATUS.md
+Description=pastore dispatcher: runs the jobs listed in policy.yaml on the GPU hosts
+Documentation=file:%h/pastore/docs/DESIGN.md
 StartLimitIntervalSec=1h
 StartLimitBurst=5
-OnFailure=unit-failed@%n.service
 
 [Service]
 Type=simple
-WorkingDirectory=/srv/projects/pastore
-ExecStart=/srv/projects/pastore/.venv/bin/python -m pastore start
+WorkingDirectory=%h/pastore
+ExecStart=%h/pastore/.venv/bin/python -m pastore start
 Restart=on-failure
 RestartSec=60
 

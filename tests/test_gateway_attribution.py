@@ -1,6 +1,6 @@
 """Gateway attribution (R21, R22): peer rules, the /proc lookup in a fake /proc, the budget, the pid cache, real /proc.
 
-Depends on: pastore.gateway.attribution, pastore.policy (the real policy.yaml rules), pastore.spec.
+Depends on: pastore.gateway.attribution, pastore.policy (the rules of policy.example.yaml), pastore.spec.
 """
 
 import ipaddress
@@ -21,16 +21,16 @@ from pastore.policy import load_policy
 from pastore.spec import UNKNOWN_LEVEL, Level, SourceRule
 
 UID = os.getuid()
-REPO_POLICY = Path(__file__).resolve().parent.parent / "policy.yaml"
-RULES = load_policy(REPO_POLICY).sources
+EXAMPLE_POLICY = Path(__file__).resolve().parent.parent / "policy.example.yaml"
+RULES = load_policy(EXAMPLE_POLICY).sources
 LOCAL: Address = ("127.0.0.1", 11434)
 SESSION = "0::/user.slice/user-1000.slice/session-3.scope"
 HEARTH = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/pastore-r123.scope"
 SERVICE = "0::/system.slice/foo.service"
-# The kernel's real /proc/net/fib_trie and /proc/net/if_inet6 layout (from this workstation), with its public
-# and VPN addresses replaced by documentation (2001:db8::/32) and made-up 100.64.x.y values.
+# The kernel's real /proc/net/fib_trie and /proc/net/if_inet6 layout, with the public and VPN addresses replaced by
+# documentation values (2001:db8::/32, 192.0.2.0/24) and made-up 100.64.x.y and fd00:: values.
 FIB_TRIE = """\
-Id 52:
+Id 100:
   +-- 100.64.0.0/10 2 0 2
      |-- 100.64.56.78
         /32 universe UNICAST
@@ -428,7 +428,9 @@ def test_a_peer_equal_to_the_local_address_goes_through_proc(proc: FakeProc) -> 
 def test_a_lan_peer_that_is_not_the_local_address_never_reads_proc(proc: FakeProc) -> None:
     peer = proc.client(40001, 9001, ip="192.0.2.5")
     proc.process(300, inodes=(9001,), cgroup=HEARTH)
-    assert _attributor(proc)(peer, ("192.0.2.9", 11434)) == Attribution(Level.REINS, "peer:192.0.2.5")
+    assert _attributor(proc)(peer, ("192.0.2.9", 11434)) == Attribution(
+        Level.REINS, "peer:192.0.2.5"
+    )
 
 
 def test_loopback_net_127_8_and_an_ipv4_mapped_local_peer(proc: FakeProc) -> None:

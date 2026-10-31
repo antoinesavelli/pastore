@@ -1,8 +1,9 @@
-"""Check 12: record the executor's health read-only every few seconds while a benchmark loads it, then compare.
+"""Check 12: sample a second host's load over read-only ssh while a job runs on it, ping it side by side, then compare.
 
 Depends on: stdlib only (argparse, json, subprocess, threading, signal, re) and `ssh`, `ping`, `journalctl` on
-PATH. Usage, from the repo root:
-`uv run python deploy/sample_executor.py record --out samples.jsonl --duration 900`
+PATH. The ssh alias, the ping address, the network interface, the health unit whose journal is counted and the
+text that marks its up and down lines are arguments with generic defaults. Usage, from the repo root:
+`uv run python deploy/sample_executor.py record --out samples.jsonl --duration 900 [--ssh-host H] [--ping-host IP]`
 `uv run python deploy/sample_executor.py summarize samples.jsonl --phases throughput.json [--json]`
 """
 
@@ -25,6 +26,8 @@ SSH_HOST = "second-host"
 GRACE_S = 30.0
 STOP_WAIT_S = 5.0
 REACH_UNIT = "workload-health"
+UP_TEXT = "health=ok"
+DOWN_TEXT = "health=down"
 REACH_CAP = 200
 
 Record = dict[str, Any]
@@ -77,7 +80,7 @@ PING_HEAD = re.compile(r"^\[(\d+(?:\.\d+)?)\].*icmp_seq=(\d+)")
 
 
 def remote_script(iface: str, interval: float, duration: int) -> str:
-    """The POSIX sh text fed to the executor: validated settings on top, then the constant read-only loop."""
+    """The POSIX sh text fed to the second host: validated settings on top, then the constant read-only loop."""
     if not re.fullmatch(r"[A-Za-z0-9_.:-]+", iface):
         raise SystemExit(f"bad --iface {iface!r}")
     return f"IFACE='{iface}'\nINTERVAL='{interval:g}'\nDURATION={duration}\n{REMOTE_BODY}"
@@ -187,8 +190,8 @@ def _derive(nums: Nums, prev: Nums | None, seconds: float | None) -> Nums:
 def exec_records(lines: Iterable[str], now: Callable[[], float]) -> Iterator[Record]:
     """One `exec` record per sample in the remote marker stream.
 
-    `ts` is `now()` when the sample marker arrives (the workstation clock, like the phases and the pings);
-    the executor's own stamp only divides the byte deltas into per-second rates.
+    `ts` is `now()` when the sample marker arrives (the local clock, like the phases and the pings);
+    the sampled host's own stamp only divides the byte deltas into per-second rates.
     """
     prev: Nums | None = None
     prev_stamp: float | None = None
@@ -239,11 +242,11 @@ def _writer(handle: IO[str]) -> Callable[[Record], None]:
     return write
 
 
-def read_reach(since: float) -> list[str]:
-    """The health probe's `health=` journal lines since `since`, system then user scope, last REACH_CAP."""
+def read_reach(since: float, unit: str, markers: tuple[str, str]) -> list[str]:
+    """The health unit's journal lines since `since` that hold an up or a down marker, system then user scope, last REACH_CAP."""
     lines: list[str] = []
     for scope in ([], ["--user"]):
-        argv = ["journalctl", *scope, "-u", REACH_UNIT, "--since", f"@{int(since)}"]
+        argv = ["journalctl", *scope, "-u", unit, "--since", f"@{int(since)}"]
         try:
             done = subprocess.run(
                 [*argv, "--no-pager", "-o", "short-iso"],
@@ -255,7 +258,7 @@ def read_reach(since: float) -> list[str]:
         except (OSError, subprocess.TimeoutExpired) as exc:
             print(f"journalctl failed: {exc}", file=sys.stderr)
             continue
-        lines += [x for x in done.stdout.splitlines() if "health=" in x]
+        lines += [x for x in done.stdout.splitlines() if any(m in x for m in markers)]
     return lines[-REACH_CAP:]
 
 
@@ -314,7 +317,17 @@ def _run_children(
     The wait ends when ssh exits, a signal is caught, or the duration plus one interval plus GRACE_S passes.
     """
     script, ssh_err, ping_err = files
-    ssh_argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-T", SSH_HOST, "sh", "-s"]
+    ssh_argv = [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=10",
+        "-T",
+        args.ssh_host,
+        "sh",
+        "-s",
+    ]
     count = str(math.ceil(args.duration + args.interval) + 2)
     ping_argv = ["ping", "-D", "-O", "-i", "1", "-c", count, args.ping_host]
     procs: list[subprocess.Popen[str]] = []
@@ -344,7 +357,7 @@ def _run_children(
 
 
 def record(args: argparse.Namespace) -> int:
-    """Sample the executor over one SSH session and ping it side by side.
+    """Sample the second host over one SSH session and ping it side by side.
 
     Exit 0 for a full run, 130 or 143 after SIGINT or SIGTERM, 1 when ssh or ping failed, ssh hung past
     the deadline, or no exec sample was recorded.
@@ -383,7 +396,12 @@ def record(args: argparse.Namespace) -> int:
             problems.append(f"ssh still running {GRACE_S:.0f} s past the end; stopped it")
         if not counts["exec"] and not caught and ssh_code in (None, 0):
             problems.append("no exec sample was recorded")
-        write({"kind": "reach", "lines": read_reach(start)})
+        write(
+            {
+                "kind": "reach",
+                "lines": read_reach(start, args.reach_unit, (args.up_text, args.down_text)),
+            }
+        )
     for problem in problems:
         print(problem, file=sys.stderr)
     if caught:
@@ -498,12 +516,12 @@ def _render(stats: dict[str, Record], keys: list[str]) -> str:
     )
 
 
-def _reach_summary(lines: list[str]) -> Record:
-    """Count the probe's `health=ok` and `health=down` lines; keep the raw lines when there are few."""
+def _reach_summary(lines: list[str], up_text: str = UP_TEXT, down_text: str = DOWN_TEXT) -> Record:
+    """Count the health lines holding the up text and those holding the down text; keep the raw lines when there are few."""
     summary: Record = {
         "lines": len(lines),
-        "up": sum("health=ok" in x for x in lines),
-        "down": sum("health=down" in x for x in lines),
+        "up": sum(up_text in x for x in lines),
+        "down": sum(down_text in x for x in lines),
     }
     if len(lines) < 10:
         summary["raw"] = lines
@@ -522,7 +540,11 @@ def summarize(args: argparse.Namespace) -> int:
             [r for r in pings if low <= r["ts"] < high],
             keys,
         )
-    reach = _reach_summary([x for r in groups.get("reach", []) for x in r.get("lines", [])])
+    reach = _reach_summary(
+        [x for r in groups.get("reach", []) for x in r.get("lines", [])],
+        args.up_text,
+        args.down_text,
+    )
     print(_render(stats, keys))
     print(f"reach: {reach['lines']} lines, up={reach['up']} down={reach['down']}")
     for raw in reach.get("raw", []):
@@ -536,16 +558,33 @@ def main() -> int:
     """Parse the subcommand and run it."""
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
-    rec = sub.add_parser("record", help="sample the executor and ping it")
+    rec = sub.add_parser("record", help="sample the second host and ping it")
     rec.add_argument("--out", required=True, help="new file; an existing one is refused")
     rec.add_argument("--duration", type=float, required=True, help="seconds")
     rec.add_argument("--interval", type=float, default=5.0, help="seconds between samples")
-    rec.add_argument("--iface", default="wlan0", help="network interface of the executor")
-    rec.add_argument("--ping-host", default="192.0.2.101")
+    rec.add_argument("--ssh-host", default=SSH_HOST, help="ssh alias of the second host")
+    rec.add_argument(
+        "--iface", default="wlan0", help="network interface of the second host to sample"
+    )
+    rec.add_argument(
+        "--ping-host", default="192.0.2.101", help="address of the second host to ping"
+    )
+    rec.add_argument(
+        "--reach-unit",
+        default=REACH_UNIT,
+        help="user or system unit whose journal holds the health lines",
+    )
     summ = sub.add_parser("summarize", help="compare before, each phase and after")
     summ.add_argument("samples")
     summ.add_argument("--phases", required=True, help="throughput.json from the benchmark script")
     summ.add_argument("--json", action="store_true", help="also print the figures as one JSON line")
+    for sp in (rec, summ):
+        sp.add_argument(
+            "--up-text", default=UP_TEXT, help="text that marks an up line of the health unit"
+        )
+        sp.add_argument(
+            "--down-text", default=DOWN_TEXT, help="text that marks a down line of the health unit"
+        )
     args = parser.parse_args()
     return record(args) if args.cmd == "record" else summarize(args)
 

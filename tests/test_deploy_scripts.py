@@ -943,7 +943,8 @@ def test_render_is_a_table_with_metrics_as_rows_and_windows_as_columns(sx: Modul
 
 
 def test_reach_summary_counts_up_and_down_and_keeps_raw_lines_under_ten(sx: ModuleType) -> None:
-    """Up/down are counted from the `health=` text; nine lines keep their raw text, ten do not."""
+    """Up/down are counted from the up and down texts; nine lines keep their raw text, ten do not."""
+    assert (sx.UP_TEXT, sx.DOWN_TEXT) == ("health=ok", "health=down")
     lines = ["t1 health=ok", "t2 health=down", "t3 health=ok", "t4 something else"]
     assert sx._reach_summary(lines) == {"lines": 4, "up": 2, "down": 1, "raw": lines}
     nine = ["x health=ok"] * 9
@@ -951,6 +952,80 @@ def test_reach_summary_counts_up_and_down_and_keeps_raw_lines_under_ten(sx: Modu
     ten = ["x health=down"] * 10
     assert sx._reach_summary(ten) == {"lines": 10, "up": 0, "down": 10}
     assert sx._reach_summary([]) == {"lines": 0, "up": 0, "down": 0, "raw": []}
+
+
+def test_reach_summary_counts_the_texts_it_is_given(sx: ModuleType) -> None:
+    """A health unit with its own log wording is counted through the up and down texts, not through the defaults."""
+    lines = ["t1 state=up", "t2 state=down", "t3 health=ok"]
+    got = sx._reach_summary(lines, "state=up", "state=down")
+    assert got == {"lines": 3, "up": 1, "down": 1, "raw": lines}
+
+
+def _journal(monkeypatch: pytest.MonkeyPatch, outputs: dict[bool, str]) -> list[list[str]]:
+    """Stub subprocess.run for journalctl: `outputs` maps "--user was passed" to the stdout; returns the argvs seen."""
+    seen: list[list[str]] = []
+
+    def fake(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        seen.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout=outputs["--user" in argv], stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake)
+    return seen
+
+
+def test_read_reach_reads_the_given_unit_system_then_user_and_keeps_only_marked_lines(
+    monkeypatch: pytest.MonkeyPatch, sx: ModuleType
+) -> None:
+    """Only lines holding the up or the down text survive; the unit and the since stamp go to journalctl."""
+    seen = _journal(
+        monkeypatch,
+        {False: "a health=ok\nStarted unit\nb health=down\n", True: "c health=ok\nStopped unit\n"},
+    )
+    got = sx.read_reach(1700000000.9, "my-health", ("health=ok", "health=down"))
+    assert got == ["a health=ok", "b health=down", "c health=ok"]
+    assert [a[:6] for a in seen] == [
+        ["journalctl", "-u", "my-health", "--since", "@1700000000", "--no-pager"],
+        ["journalctl", "--user", "-u", "my-health", "--since", "@1700000000"],
+    ]
+
+
+def test_read_reach_keeps_only_the_last_reach_cap_lines(
+    monkeypatch: pytest.MonkeyPatch, sx: ModuleType
+) -> None:
+    """A long journal is cut to its last REACH_CAP marked lines."""
+    text = "".join(f"n{i} health=ok\n" for i in range(sx.REACH_CAP + 5))
+    _journal(monkeypatch, {False: text, True: ""})
+    got = sx.read_reach(0.0, sx.REACH_UNIT, (sx.UP_TEXT, sx.DOWN_TEXT))
+    assert len(got) == sx.REACH_CAP and got[0] == "n5 health=ok"
+
+
+def test_the_record_arguments_default_to_generic_names_and_take_the_hosts_own(
+    monkeypatch: pytest.MonkeyPatch, sx: ModuleType
+) -> None:
+    """The ssh alias, ping address, interface, health unit and texts are arguments; the defaults name nothing private."""
+    seen: list[argparse.Namespace] = []
+    monkeypatch.setattr(sx, "record", lambda args: seen.append(args) or 0)
+    base = ["sample_executor.py", "record", "--out", "o.jsonl", "--duration", "60"]
+    monkeypatch.setattr("sys.argv", base)
+    assert sx.main() == 0
+    defaults = seen[0]
+    assert (defaults.ssh_host, defaults.ping_host, defaults.iface) == (
+        "second-host",
+        "192.0.2.101",
+        "wlan0",
+    )
+    assert (defaults.reach_unit, defaults.up_text, defaults.down_text) == (
+        "workload-health",
+        "health=ok",
+        "health=down",
+    )
+    own = ["--ssh-host", "h", "--ping-host", "192.0.2.7", "--iface", "eth1"]
+    own += ["--reach-unit", "u", "--up-text", "U", "--down-text", "D"]
+    monkeypatch.setattr("sys.argv", [*base, *own])
+    assert sx.main() == 0
+    got = seen[1]
+    assert (got.ssh_host, got.ping_host, got.iface) == ("h", "192.0.2.7", "eth1")
+    assert (got.reach_unit, got.up_text, got.down_text) == ("u", "U", "D")
 
 
 def _write(path: Path, text: str) -> str:
@@ -1057,7 +1132,10 @@ def test_summarize_assigns_records_to_half_open_windows_and_prints_table_reach_a
             {"kind": "reach", "lines": ["t3 health=ok"]},
         ),
     )
-    assert sx.summarize(argparse.Namespace(samples=samples, phases=phases, json=True)) == 0
+    args = argparse.Namespace(
+        samples=samples, phases=phases, json=True, up_text=sx.UP_TEXT, down_text=sx.DOWN_TEXT
+    )
+    assert sx.summarize(args) == 0
     out = capsys.readouterr().out.splitlines()
     assert out[0].split() == [
         "metric",
@@ -1133,7 +1211,10 @@ def test_summarize_of_an_empty_samples_file_prints_empty_windows(
         tmp_path / "t.json", json.dumps({"phases": {"only": {"start": 1.0, "end": 2.0}}})
     )
     samples = _write(tmp_path / "s.jsonl", "")
-    assert sx.summarize(argparse.Namespace(samples=samples, phases=phases, json=False)) == 0
+    args = argparse.Namespace(
+        samples=samples, phases=phases, json=False, up_text=sx.UP_TEXT, down_text=sx.DOWN_TEXT
+    )
+    assert sx.summarize(args) == 0
     out = capsys.readouterr().out.splitlines()
     assert out[0].split() == [
         "metric",
