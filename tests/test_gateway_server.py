@@ -35,6 +35,7 @@ from tests.gateway_fakes import FakeUpstream, ScriptedAttribution, refused_url, 
 LEVEL_NAMES = ("reins", "webui", "coding", "corsu", "routine", "hearth")
 CHAT = {"model": "m", "prompt": "hi"}
 MIB = 1024 * 1024
+STARTED_AT = "2026-10-31T12:00:00+00:00"
 
 
 class Reply(NamedTuple):
@@ -173,6 +174,7 @@ async def rig(
             state_paths=state_paths or default_paths(tmp_path),
             clock=clock,
             log=lines.append,
+            started_at=STARTED_AT,
             starve_after_s=starve_after_s,
         )
         cancelled: list[str] = []
@@ -1083,7 +1085,8 @@ def test_status_lists_every_host_with_slots_of_parallel_times_models(tmp_path: P
                         "oldest_wait_s": None,
                     }
                     for name in (WORKSTATION, "executor")
-                }
+                },
+                "started_at": STARTED_AT,
             }
 
     run(scenario())

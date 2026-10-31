@@ -131,8 +131,10 @@ class _Gateway:
         clock: Callable[[], float],
         log: Callable[[str], None],
         starve_after_s: float,
+        started_at: str,
     ) -> None:
         self._policy = policy
+        self._started_at = started_at
         self._attribute = attribute
         self._state_paths = state_paths
         self._clock = clock
@@ -173,7 +175,7 @@ class _Gateway:
         if not peername or not is_loopback(peername[0]):
             raise web.HTTPForbidden()
         hosts = {name: asdict(queue.snapshot()) for name, queue in self._queues.items()}
-        return web.json_response({"hosts": hosts})
+        return web.json_response({"hosts": hosts, "started_at": self._started_at})
 
     async def _gated(self, request: web.Request) -> web.StreamResponse:
         started = self._clock()
@@ -280,10 +282,15 @@ def make_app(
     state_paths: StatePaths,
     clock: Callable[[], float],
     log: Callable[[str], None],
+    started_at: str,
     starve_after_s: float = STARVE_AFTER_S,
 ) -> web.Application:
-    """Build the gateway application; the caller runs it with `handler_cancellation=True`."""
-    gateway = _Gateway(policy, attribute, state_paths, clock, log, starve_after_s)
+    """Build the gateway application; the caller runs it with `handler_cancellation=True`.
+
+    `started_at` is the gateway's start as UTC ISO-8601; `/pastore/status` reports it, so the dispatcher can tell a
+    run that a gateway restart cut short (D-050 (4)).
+    """
+    gateway = _Gateway(policy, attribute, state_paths, clock, log, starve_after_s, started_at)
     app = web.Application(client_max_size=MAX_BODY_BYTES, handler_args={"auto_decompress": False})
     app.cleanup_ctx.append(_upstream_session)
     app.router.add_route("*", "/{tail:.*}", gateway.handle)

@@ -6,6 +6,7 @@ Depends on: pastore.policy, pastore.state, pastore.gateway.attribution and serve
 import argparse
 import sys
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 from aiohttp import web
@@ -44,6 +45,7 @@ def main(argv: list[str] | None = None) -> int:
         state_paths=default_paths(Path.home()),
         clock=time.monotonic,
         log=_log,
+        started_at=datetime.now(UTC).isoformat(),
     )
     _log(f"gateway listening {args.host}:{args.port} policy={args.policy}")
     web.run_app(
