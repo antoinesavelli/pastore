@@ -52,6 +52,9 @@ def load(
 
 EXECUTOR = host("executor", 10)
 WORKSTATION_HOST = host(WORKSTATION, 24)
+# base_need jumps from 10 GiB to 10 GiB + 2 between EXACT_10_GIB and OVER_10_GIB;
+# this card puts OVER_10_GIB one byte over
+EXECUTOR_ONE_BYTE_UP = host("executor", (10 * GIB + 1) / GIB)
 
 
 def test_gib_is_1024_cubed_and_the_base_need_adds_exactly_one_gib() -> None:
@@ -100,11 +103,13 @@ def test_need_bytes_is_none_when_the_kv_size_is_unknown() -> None:
 
 def test_check8_a_model_needing_over_10_gib_never_lands_on_the_executor() -> None:
     big = {MODEL: OVER_10_GIB}
-    assert place(MODEL, [load(EXECUTOR, big)]) is None
-    assert place(MODEL, [load(EXECUTOR, big, resident={MODEL: OVER_10_GIB})]) is None
-    on_both = [load(EXECUTOR, big, resident={MODEL: OVER_10_GIB}), load(WORKSTATION_HOST, big)]
+    ex = EXECUTOR_ONE_BYTE_UP
+    assert free_bytes(load(ex)) + 1 == base_need(OVER_10_GIB)
+    assert place(MODEL, [load(ex, big)]) is None
+    assert place(MODEL, [load(ex, big, resident={MODEL: OVER_10_GIB})]) is None
+    on_both = [load(ex, big, resident={MODEL: OVER_10_GIB}), load(WORKSTATION_HOST, big)]
     assert place(MODEL, on_both) == WORKSTATION
-    assert place(MODEL, [load(WORKSTATION_HOST, big), load(EXECUTOR, big)]) == WORKSTATION
+    assert place(MODEL, [load(WORKSTATION_HOST, big), load(ex, big)]) == WORKSTATION
 
 
 def test_check8_a_model_needing_exactly_10_gib_fits_an_empty_10_gib_host() -> None:
@@ -276,7 +281,8 @@ def test_a_host_at_max_models_is_not_eligible_even_when_the_model_is_resident() 
 
 
 def test_a_host_below_max_models_is_eligible() -> None:
-    ld = load(host("executor", 10, max_models=3), {MODEL: SMALL, OTHER: GIB}, held=(OTHER,))
+    models = {MODEL: SMALL, OTHER: GIB, "third": GIB}
+    ld = load(host("executor", 10, max_models=3), models, held=(OTHER, "third"))
     assert place(MODEL, [ld]) == "executor"
 
 
@@ -379,9 +385,10 @@ def test_d041_an_unknown_kv_size_is_refused_when_any_run_is_held() -> None:
 
 
 def test_d041_an_unknown_kv_size_is_refused_when_the_base_need_exceeds_the_card() -> None:
-    assert place(MODEL, [load(EXECUTOR, {MODEL: OVER_10_GIB}, kv=None)]) is None
+    ex = EXECUTOR_ONE_BYTE_UP
+    assert place(MODEL, [load(ex, {MODEL: OVER_10_GIB}, kv=None)]) is None
     fallback = [
-        load(EXECUTOR, {MODEL: OVER_10_GIB}, kv=None),
+        load(ex, {MODEL: OVER_10_GIB}, kv=None),
         load(WORKSTATION_HOST, {MODEL: OVER_10_GIB}, kv=None),
     ]
     assert place(MODEL, fallback) == WORKSTATION
