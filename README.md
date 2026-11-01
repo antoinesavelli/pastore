@@ -59,6 +59,8 @@ is `docs/STATUS.md`, and agent instructions are `AGENTS.md`.
 | `pastore/dispatcher.py` | The loop (`serve`, which binds SIGTERM and the SIGALRM tick bound and restores both on exit) and one-tick decisions: listing gate, idle reasons, N runs per host, placement, attempts, crashes, readers, run-now (cleared only where acted on), the daily run-folder prune |
 | `pastore/placement.py` · `hosts.py` | Where a run goes (R25 with D-041: need, free VRAM from the host's `vram_gib`, preference, `no-fit`) · per-host model facts and the executor probe (`executor-down`) |
 | `pastore/policy.py` | `policy.yaml`: parse (no YAML aliases; a crafted file is a `PolicyError`, so the last good policy stays), last-good cache, add/remove rendering and diff |
+| `pastore/policy_watch.py` | The optional `watch:` section of `policy.yaml`: parse into typed signals and render them back |
+| `pastore/policy_fields.py` | The field validators and YAML quoting that `policy.py` and `policy_watch.py` share |
 | `pastore/manifest.py` | Consumer `gpu-tasks.yaml`: schema, path rule, per-task fingerprint → `TaskSpec` |
 | `pastore/state.py` | SQLite WAL state, schema version, dispatcher lock, reset |
 | `pastore/checks.py` | Workstation pre-start checks (driver, Ollama, foreign GPU process, memory) → closed-list idle reason; a global gate |

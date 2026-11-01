@@ -1,6 +1,6 @@
 """Shared value types: tasks, hosts, source levels and rules, listed pairs, the watch section, and the closed idle-reason and event lists.
 
-Depends on: nothing in pastore; manifest.py and policy.py build these, every other module only reads them.
+Depends on: nothing in pastore; manifest.py, policy.py and policy_watch.py build these, every other module only reads them.
 """
 
 from collections.abc import Mapping

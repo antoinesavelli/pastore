@@ -299,7 +299,9 @@ One row per module under `pastore/`; the unit texts and measurement scripts are 
 |---|---|
 | `spec.py` | Shared value types (`TaskSpec`, `Host`, `Pair`, readers, `Ready`, source levels and rules) and the closed idle-reason and event lists |
 | `fake_ollama.py` | The fake Ollama that `check --contract` and the tests run against |
-| `policy.py` | Parse and check `policy.yaml` (including the `watch:` section), last good copy, `add` and `remove` diff and rendering (R6, R29) |
+| `policy.py` | Parse and check `policy.yaml`, last good copy, `add` and `remove` diff and rendering (R6, R29) |
+| `policy_watch.py` | Parse, check and render the optional `watch:` section of `policy.yaml` |
+| `policy_fields.py` | The field validators and YAML quoting shared by `policy.py` and `policy_watch.py` |
 | `manifest.py` | Parse and check `gpu-tasks.yaml`, the path rule (R5), per-task fingerprints |
 | `state.py` | SQLite WAL schema, `user_version`, the dispatcher lock, heartbeat, read-only open, reset (R15) |
 | `cli.py`, `__main__.py` | The argparse surface and `pastore status`; the only place the real clock and host are bound for the dispatcher side (the gateway binds its own in `gateway/__main__.py`) |
