@@ -7,6 +7,7 @@ Tests for pastore. No test touches the real GPU, the real Ollama, real systemd o
 | `fakes.py` | `FakeClock` and `RecordingRunner` test doubles (a helper, not a test) |
 | `test_fakes.py` | `pastore/fake_ollama.py` and `fakes.py` behave as documented |
 | `test_policy.py` | `policy.yaml` parsing, the optional `watch:` section (validation, render round trip with backslashes), the tracked `policy.example.yaml`, last-good on parse error, `add`/`remove` diffs |
+| `test_policy_watch.py` | The `watch:` parser and renderer and the shared field helpers, each imported directly: render then parse round trip, section layout, `check_fields` messages and their order, `yaml_key` and `quote` |
 | `test_manifest.py` | `gpu-tasks.yaml` schema, the argv/cwd path rule, per-task fingerprints |
 | `test_state.py` | SQLite schema, `user_version` mismatch refusal, rows of the retired watch names kept and ignored, the dispatcher lock, heartbeat, reset |
 | `test_cli.py` | The CLI surface and its exit codes; `status` lines from state and from the gateway's `/pastore/status` |

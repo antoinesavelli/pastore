@@ -1,6 +1,6 @@
 """Parse and validate policy.yaml v2 (hosts, sources, consumers, listed pairs, the optional watch), keep the last good copy, render and edit.
 
-Depends on: spec (Host, Level, Pair, SourceRule, the signal and WatchConfig types, WORKSTATION and the source-kind lists), PyYAML and stdlib only.
+Depends on: policy_fields (the field validators and YAML quoting), policy_watch (the `watch:` parser and renderer), spec (Host, Level, Pair, SourceRule, WatchConfig, WORKSTATION and the source-kind lists), PyYAML and stdlib only.
 """
 
 import difflib
@@ -16,6 +16,8 @@ import yaml
 from yaml.composer import ComposerError
 from yaml.constructor import ConstructorError
 
+from pastore.policy_fields import check_fields, matching, positive, quote, yaml_key
+from pastore.policy_watch import parse_watch, render_watch
 from pastore.spec import (
     EXCLUDABLE_KINDS,
     SOURCE_KINDS,
@@ -23,10 +25,7 @@ from pastore.spec import (
     Host,
     Level,
     Pair,
-    PatternSignal,
-    Signal,
     SourceRule,
-    ValueSignal,
     WatchConfig,
 )
 
@@ -34,10 +33,6 @@ VERSION = 2
 KEYS = frozenset({"version", "hosts", "sources", "consumers", "jobs"})
 OPTIONAL_KEYS = frozenset({"watch"})
 RULE_KEYS = frozenset({"level", "exclude", *SOURCE_KINDS})
-WATCH_KEYS = frozenset({"status", "signals"})
-MAX_SIGNALS = 8
-SIGNAL_NAME = re.compile(r"[a-z][a-z0-9-]{0,31}")
-UNIT_NAME = re.compile(r"[A-Za-z0-9:_.\\@][A-Za-z0-9:_.\\@-]*")
 MANIFEST_NAME = "gpu-tasks.yaml"
 NAME = re.compile(r"[a-z0-9][a-z0-9_-]*")
 URL = re.compile(r"http://(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):0*([0-9]{1,5})/?")
@@ -71,40 +66,6 @@ class Policy:
     consumers: Mapping[str, Path]
     jobs: tuple[Pair, ...]
     watch: WatchConfig | None = None
-
-
-def _fields(
-    where: str, raw: object, shape: Mapping[str, Callable[[object], Any]], problems: list[str]
-) -> dict[str, Any] | None:
-    """Check a mapping with exactly the keys of `shape`; each validator returns the stored value or raises."""
-    if not isinstance(raw, dict):
-        problems.append(f"{where} must be a mapping with {', '.join(shape)}")
-        return None
-    before = len(problems)
-    problems += [f"{where}: unknown key {k!r}" for k in raw if k not in shape]
-    problems += [f"{where}: missing key {k!r}" for k in sorted(shape.keys() - raw.keys())]
-    fields: dict[str, Any] = {}
-    for key in (k for k in shape if k in raw):
-        try:
-            fields[key] = shape[key](raw[key])
-        except ValueError as exc:
-            problems.append(f"{where}: {key} {exc}")
-    return fields if len(problems) == before else None
-
-
-def _matching(form: re.Pattern[str], what: str) -> Callable[[object], str]:
-    def check(value: object) -> str:
-        if not isinstance(value, str) or not form.fullmatch(value):
-            raise ValueError(f"must be {what}, got {value!r}")
-        return value
-
-    return check
-
-
-def _positive(value: object) -> int:
-    if type(value) is not int or value <= 0:
-        raise ValueError(f"must be a positive int, got {value!r}")
-    return value
 
 
 def _positive_number(value: object) -> float:
@@ -146,11 +107,11 @@ def _parse_host(name: object, body: object, problems: list[str]) -> Host | None:
     shape = {
         "url": _normalize_url,
         "vram_gib": _positive_number,
-        "max_models": _positive,
-        "parallel": _positive,
-        "context": _positive,
+        "max_models": positive,
+        "parallel": positive,
+        "context": positive,
     }
-    fields = _fields(f"host {name!r}", body, shape, problems)
+    fields = check_fields(f"host {name!r}", body, shape, problems)
     return None if fields is None else Host(name, **fields)
 
 
@@ -314,11 +275,11 @@ def _parse_pair(
 ) -> Pair | None:
     shape = {
         "task": _task(consumers),
-        "model": _matching(re.compile(r"\S+"), "a non-empty string without whitespace"),
-        "evidence": _matching(re.compile(r"/.*", re.DOTALL), "an absolute path string"),
-        "sha256": _matching(re.compile(r"[0-9a-f]{64}"), "64 lowercase hex characters"),
+        "model": matching(re.compile(r"\S+"), "a non-empty string without whitespace"),
+        "evidence": matching(re.compile(r"/.*", re.DOTALL), "an absolute path string"),
+        "sha256": matching(re.compile(r"[0-9a-f]{64}"), "64 lowercase hex characters"),
     }
-    fields = _fields(where, raw, shape, problems)
+    fields = check_fields(where, raw, shape, problems)
     if fields is None:
         return None
     return Pair(fields["task"], fields["model"], Path(fields["evidence"]), fields["sha256"])
@@ -344,79 +305,6 @@ def _parse_jobs(
             seen.add((pair.task, pair.model))
             pairs.append(pair)
     return tuple(pairs)
-
-
-def _regex(groups: int | None = None) -> Callable[[object], str]:
-    """A validator for a non-empty string that compiles as a regex, with exactly `groups` capture groups when given."""
-
-    def check(value: object) -> str:
-        if not isinstance(value, str) or not value:
-            raise ValueError(f"must be a non-empty regex string, got {value!r}")
-        try:
-            compiled = re.compile(value)
-        except (re.error, OverflowError, RecursionError) as exc:
-            raise ValueError(f"is not a valid regex ({exc}): {value!r}") from None
-        if groups is not None and compiled.groups != groups:
-            raise ValueError(f"must have exactly {groups} capture group, got {compiled.groups}")
-        return value
-
-    return check
-
-
-def _parse_signal(where: str, raw: object, problems: list[str]) -> Signal | None:
-    if not isinstance(raw, dict):
-        problems.append(f"{where} must be a mapping with name, unit, good + bad or value + limit")
-        return None
-    before = len(problems)
-    first_bad = raw.get("first_bad", False)
-    if type(first_bad) is not bool:
-        problems.append(f"{where}: first_bad must be true or false, got {first_bad!r}")
-    body = {k: v for k, v in raw.items() if k != "first_bad"}
-    common = {
-        "name": _matching(SIGNAL_NAME, f"a name matching {SIGNAL_NAME.pattern}"),
-        "unit": _matching(UNIT_NAME, "a systemd unit name (not starting with '-')"),
-    }
-    kind = ValueSignal if "value" in body or "limit" in body else PatternSignal
-    if kind is ValueSignal:
-        shape = {**common, "value": _regex(1), "limit": _positive}
-    else:
-        shape = {**common, "good": _regex(), "bad": _regex()}
-    fields = _fields(where, body, shape, problems)
-    return None if fields is None or len(problems) > before else kind(**fields, first_bad=first_bad)
-
-
-def _parse_signals(raw: object, problems: list[str]) -> tuple[Signal, ...]:
-    if not isinstance(raw, list) or not 1 <= len(raw) <= MAX_SIGNALS:
-        problems.append(f"watch.signals must be a list of 1 to {MAX_SIGNALS} signals")
-        return ()
-    parsed = [_parse_signal(f"watch.signals[{i}]", item, problems) for i, item in enumerate(raw)]
-    signals = tuple(signal for signal in parsed if signal is not None)
-    names = [signal.name for signal in signals]
-    problems += [
-        f"watch.signals: name {n!r} is used twice"
-        for n in dict.fromkeys(names)
-        if names.count(n) > 1
-    ]
-    return signals
-
-
-def _parse_watch(raw: object, problems: list[str]) -> WatchConfig | None:
-    if not isinstance(raw, dict):
-        problems.append(f"watch must be a mapping with {', '.join(sorted(WATCH_KEYS))}")
-        return None
-    before = len(problems)
-    problems += [f"watch: unknown key {k!r}" for k in raw if k not in WATCH_KEYS]
-    problems += [f"watch: missing key {k!r}" for k in sorted(WATCH_KEYS - raw.keys())]
-    signals = _parse_signals(raw["signals"], problems) if "signals" in raw else ()
-    status = raw.get("status")
-    if len(problems) > before:
-        return None
-    if not isinstance(status, str) or not any(
-        isinstance(s, PatternSignal) and s.name == status for s in signals
-    ):
-        problems.append(f"watch: status {status!r} must name a signal with good and bad patterns")
-        return None
-    return WatchConfig(status, signals)
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
@@ -466,7 +354,7 @@ def _parse(text: str) -> Policy:
     sources = _parse_sources(data.get("sources"), problems)
     consumers = _parse_consumers(data.get("consumers"), problems)
     jobs = _parse_jobs(data.get("jobs"), consumers, problems)
-    watch = _parse_watch(data["watch"], problems) if "watch" in data else None
+    watch = parse_watch(data["watch"], problems) if "watch" in data else None
     if problems:
         raise PolicyError("; ".join(problems))
     return Policy(hosts, sources, consumers, jobs, watch)
@@ -519,17 +407,8 @@ class PolicyCache:
         return None
 
 
-def _quote(value: object) -> str:
-    dumped = yaml.safe_dump(str(value), default_style='"', width=sys.maxsize, allow_unicode=False)
-    return dumped.removesuffix("\n")
-
-
-def _key(name: str) -> str:
-    return name if yaml.safe_load(name) == name else _quote(name)
-
-
 def _strings(values: tuple[str, ...]) -> str:
-    return "[" + ", ".join(_quote(v) for v in values) + "]"
+    return "[" + ", ".join(quote(v) for v in values) + "]"
 
 
 def _yaml_float(value: float) -> str:
@@ -540,10 +419,10 @@ def _yaml_float(value: float) -> str:
 
 def _host_line(host: Host) -> str:
     fields = (
-        f"url: {_quote(host.url)}, vram_gib: {_yaml_float(host.vram_gib)}, max_models: {host.max_models},"
+        f"url: {quote(host.url)}, vram_gib: {_yaml_float(host.vram_gib)}, max_models: {host.max_models},"
         f" parallel: {host.parallel}, context: {host.context}"
     )
-    return f"  {_key(host.name)}: {{{fields}}}"
+    return f"  {yaml_key(host.name)}: {{{fields}}}"
 
 
 def _rule_line(rule: SourceRule) -> str:
@@ -554,24 +433,8 @@ def _rule_line(rule: SourceRule) -> str:
 
 
 def _pair_line(pair: Pair) -> str:
-    fields = f"task: {_quote(pair.task)}, model: {_quote(pair.model)}, evidence: {_quote(pair.evidence)}, sha256: {_quote(pair.sha256)}"
+    fields = f"task: {quote(pair.task)}, model: {quote(pair.model)}, evidence: {quote(pair.evidence)}, sha256: {quote(pair.sha256)}"
     return f"  - {{{fields}}}"
-
-
-def _single(value: str) -> str:
-    """A single-quoted scalar, which keeps a regex's backslashes as written; text that is not printable ASCII is double-quoted."""
-    if value.isascii() and value.isprintable():
-        return "'" + value.replace("'", "''") + "'"
-    return _quote(value)
-
-
-def _signal_line(signal: Signal) -> str:
-    if isinstance(signal, ValueSignal):
-        match = f"value: {_single(signal.value)}, limit: {signal.limit}"
-    else:
-        match = f"good: {_single(signal.good)}, bad: {_single(signal.bad)}"
-    first_bad = ", first_bad: true" if signal.first_bad else ""
-    return f"    - {{name: {_key(signal.name)}, unit: {_quote(signal.unit)}, {match}{first_bad}}}"
 
 
 def render_policy(policy: Policy) -> str:
@@ -581,7 +444,7 @@ def render_policy(policy: Policy) -> str:
     lines += ["sources:", *(_rule_line(r) for r in policy.sources)]
     if policy.consumers:
         lines.append("consumers:")
-        lines += [f"  {_key(n)}: {_quote(p)}" for n, p in policy.consumers.items()]
+        lines += [f"  {yaml_key(n)}: {quote(p)}" for n, p in policy.consumers.items()]
     else:
         lines.append("consumers: {}")
     if policy.jobs:
@@ -589,8 +452,7 @@ def render_policy(policy: Policy) -> str:
     else:
         lines.append("jobs: []")
     if policy.watch is not None:
-        lines += ["watch:", f"  status: {_key(policy.watch.status)}", "  signals:"]
-        lines += [_signal_line(s) for s in policy.watch.signals]
+        lines += render_watch(policy.watch)
     return "\n".join(lines) + "\n"
 
 

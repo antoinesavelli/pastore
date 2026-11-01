@@ -8,7 +8,7 @@ front door (`pastore-gateway.service`, `:11434`) are user services on the workst
 (`pastore-executor-link.service`) reaches the second Ollama host. It is a single-user tool. The real `policy.yaml` is
 private and gitignored; `policy.example.yaml` is the placeholder the repo ships.
 
-**Tests.** About 1,600 tests (1,626 at the last full run), all against fakes: no test touches a real GPU, a real Ollama
+**Tests.** About 1,600 tests (1,633 at the last full run), all against fakes: no test touches a real GPU, a real Ollama
 or real systemd. ruff, `ruff format --check` and `mypy --strict` are clean. v5 was built in units by AI coding agents,
 each unit checked by a separate fresh reviewer against the tests and checks; the owner decides what is listed.
 
