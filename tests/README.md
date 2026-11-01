@@ -14,7 +14,7 @@ Tests for pastore. No test touches the real GPU, the real Ollama, real systemd o
 | `test_checks.py` | Each pre-start check and its closed-list idle reason |
 | `test_runner.py` | Run directories, the `systemd-run --user` scope argv, timeouts, stop, leftover-scope recovery |
 | `test_contract.py` | The three contract scenarios against the fake Ollama |
-| `test_dispatcher.py` | Ordering, N runs per host, placement, checks 8 and 9, run-now, stop, attempts, crash accounting, events |
+| `test_dispatcher.py` | Ordering, N runs per host, placement, each host's own max_models, parallel and context, checks 8 and 9, run-now, stop, attempts, crash accounting, events |
 | `test_dispatcher_gateway_outage.py` | D-050 (4): a non-ok end with the gateway unreachable, or restarted since the run began, is `stopped` with `ollama-down` and not charged; a 404, bad JSON or an old, naive or missing `started_at` is charged as before; a lost executor keeps priority; a clean end never reads the status page |
 | `test_dispatcher_tick_bound.py` | D-050 (6): the 60 s SIGALRM tick bound over the real `serve`: an overrun is a `tick-error`, a start, an end or a stop in progress finishes first, a running job is never touched, the timer is disarmed before the nap, a pending run-now survives an overrun, the handlers are restored |
 | `test_retention.py` | D-050 (7): run folders older than 30 days are deleted except each pair's latest; the run rows stay |

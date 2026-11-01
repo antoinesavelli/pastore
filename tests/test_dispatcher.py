@@ -1189,15 +1189,20 @@ def test_d023_a_pair_listed_later_does_not_double_up_the_untagged_model_of_a_run
     assert [(r.ref, r.host) for r in rows] == [("c/a", EXECUTOR), ("c/b", WORKSTATION)]
 
 
-@pytest.mark.parametrize(("context", "starts"), [(32768, False), (8192, True)])
+@pytest.mark.parametrize(
+    ("context", "executor_context", "starts"), [(32768, 8192, False), (8192, 32768, True)]
+)
 def test_the_kv_cache_is_counted_at_the_hosts_context(
-    tmp_path: Path, context: int, starts: bool
+    tmp_path: Path, context: int, executor_context: int, starts: bool
 ) -> None:
     net = net_of({MODEL: GIB})
     net.ps[WS_URL] = {"other": (20 * GIB, 20 * GIB)}  # 4 GiB free
     net.info[LATEST] = {**INFO, "llama.block_count": 32, "llama.attention.head_count_kv": 8}
     net.info[LATEST]["llama.attention.key_length"] = 64  # 2 GiB a slot at 32768, 0.5 GiB at 8192
-    hosts = {WORKSTATION: replace(WORKSTATION_ONLY[WORKSTATION], context=context)}
+    hosts = {
+        WORKSTATION: replace(FLEET[WORKSTATION], context=context),
+        EXECUTOR: replace(FLEET[EXECUTOR], context=executor_context),
+    }
     rig = fleet_rig(tmp_path, net, ["c/a"], hosts=hosts)
     rig.tick()
     assert (len(rig.handles) == 1) is starts
@@ -1388,6 +1393,26 @@ def test_a_run_on_the_executor_does_not_use_up_a_workstation_slot(tmp_path: Path
     assert [(r.model, r.host) for r in rows] == [("m1", EXECUTOR), ("m2", WORKSTATION)]
 
 
+@pytest.mark.parametrize(("ws_cap", "ex_cap"), [(1, 3), (3, 1)])
+def test_each_host_is_capped_at_its_own_max_models(
+    tmp_path: Path, ws_cap: int, ex_cap: int
+) -> None:
+    on_ws = dict.fromkeys(("w1", "w2", "w3"), GIB)
+    on_ex = dict.fromkeys(("x1", "x2", "x3"), GIB)
+    hosts = {
+        WORKSTATION: replace(FLEET[WORKSTATION], max_models=ws_cap),
+        EXECUTOR: replace(FLEET[EXECUTOR], max_models=ex_cap),
+    }
+    models = (*on_ws, *on_ex)
+    rig = fleet_rig(
+        tmp_path, net_of(on_ws, on_ex), [("c/a", m) for m in models], models=models, hosts=hosts
+    )
+    rig.next_codes = [None]
+    rig.tick()
+    started = [r.host for r in rig.state.runs_with_status("running")]
+    assert (started.count(WORKSTATION), started.count(EXECUTOR)) == (ws_cap, ex_cap)
+
+
 def test_a_models_loaded_size_on_the_executor_does_not_leak_to_the_workstation(
     tmp_path: Path,
 ) -> None:
@@ -1409,6 +1434,24 @@ def test_the_kv_cache_is_counted_at_the_executors_own_context(
     info = {**INFO, "llama.block_count": 32, "llama.attention.head_count_kv": 8}
     net.info[LATEST] = {**info, "llama.attention.key_length": 128}  # 1 GiB per slot at 8192
     hosts = {**WORKSTATION_ONLY, EXECUTOR: replace(FLEET[EXECUTOR], context=context, parallel=1)}
+    rig = fleet_rig(tmp_path, net, ["c/a"], hosts=hosts)
+    rig.tick()
+    assert (len(rig.handles) == 1) is starts
+    assert rig.state.idle_reason() == (None if starts else "no-fit")
+
+
+@pytest.mark.parametrize(("parallel", "executor_parallel", "starts"), [(3, 1, False), (1, 3, True)])
+def test_the_kv_cache_is_sized_by_the_hosts_own_parallel(
+    tmp_path: Path, parallel: int, executor_parallel: int, starts: bool
+) -> None:
+    net = net_of({MODEL: GIB})
+    net.ps[WS_URL] = {"other": (20 * GIB, 20 * GIB)}  # 4 GiB free
+    info = {**INFO, "llama.block_count": 32, "llama.attention.head_count_kv": 8}
+    net.info[LATEST] = {**info, "llama.attention.key_length": 32}  # 1 GiB per slot at 32768
+    hosts = {
+        WORKSTATION: replace(FLEET[WORKSTATION], parallel=parallel),
+        EXECUTOR: replace(FLEET[EXECUTOR], parallel=executor_parallel),
+    }
     rig = fleet_rig(tmp_path, net, ["c/a"], hosts=hosts)
     rig.tick()
     assert (len(rig.handles) == 1) is starts
