@@ -14,7 +14,7 @@ it is private and gitignored; `policy.example.yaml` is the placeholder the repo 
 Python 3.12 with uv, runtime dependencies PyYAML and aiohttp (both pinned), stdlib otherwise; ruff, mypy, pytest.
 Entry: `pastore/cli.py`. pastore never imports another repo's code; subprocess only.
 
-<!-- doctrine-core:begin (source: /mnt/ParamoStorage/system-library/AGENT_DOCTRINE_CORE.md; edit there, then run check.sh agents in system-library) -->
+<!-- doctrine-core:begin (source: AGENT_DOCTRINE_CORE.md in system-library; edit there, then run check.sh agents in system-library) -->
 ## Operating doctrine (core)
 
 Loop: OBSERVE real state (the docs/map and the actual code or system, never memory of a prior
@@ -54,7 +54,7 @@ staged. Found a hunk you didn't write? Stop and find out whose it is.
 
 **Context is spend.** Every turn re-reads the whole conversation: batch independent calls in one turn, grep before reading and read only the lines needed, cap command output (`head`, `grep -m`, `--stat`). **Don't grow a window past its task:** separable work (a follow-up, an unrelated finding, the next phase, a heavy read or search) starts in a fresh context, not here — call `spawn_task` (the chip the user clicks to open a new session; its prompt must stand alone) or delegate to a subagent; where neither exists, offer a handoff prompt at the task boundary.
 
-Full doctrine, read the section on demand (`/mnt/ParamoStorage/system-library/AGENT_DOCTRINE.md`):
+Full doctrine, read the section on demand (`AGENT_DOCTRINE.md` in system-library; `~/CLAUDE.md` gives its path):
 *Code conventions* and *Testing* before code, *Writing* before a doc · *Concurrent sessions* before
 you stage or commit · *Before you ACT* and *Subagents* before delegating · *Cost and resources* before
 a paid or heavy job · *Skills fix themselves* if a skill misfires · when a guard fails.
